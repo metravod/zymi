@@ -535,8 +535,6 @@ fn step_git_backup(memory_dir: &Path) {
     println!("  \x1b[1;32m+\x1b[0m Git backup configured!");
 }
 
-/// Clone a git repo into the memory directory.
-/// If memory/ already has files, merges the clone contents with existing files.
 // ============================================================
 // UI helpers
 // ============================================================

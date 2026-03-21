@@ -326,12 +326,23 @@ install_daemon() {
 
         # When piped via curl|bash, stdin is the pipe (EOF).
         # Read interactive input from /dev/tty instead.
-        if [ ! -t 0 ] && [ -e /dev/tty ]; then
+        # If no tty available (non-interactive SSH), skip setup entirely.
+        if [ -t 0 ]; then
+            exec 3<&0
+        elif [ -e /dev/tty ]; then
             exec 3</dev/tty
         else
-            exec 3<&0
+            echo ""
+            dim "  No interactive terminal available — skipping setup."
+            echo ""
+            echo "  Configure manually:"
+            dim "    sudo nano $ENV_FILE"
+            dim "    sudo systemctl restart zymi"
+            NEEDS_SETUP=false
         fi
+    fi
 
+    if [ "$NEEDS_SETUP" = true ]; then
         # Telegram token
         local cur_token
         cur_token="$(env_val TELOXIDE_TOKEN)"

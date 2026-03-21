@@ -7,10 +7,53 @@ const PID_FILE: &str = ".zymi.pid";
 const LOG_FILE: &str = "zymi.log"; // relative to memory_dir
 const GITHUB_REPO: &str = "metravod/zymi";
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/zymi.service";
+const SYSTEMD_ENV_FILE: &str = "/opt/zymi/.env";
+const SYSTEMD_MEMORY_DIR: &str = "/opt/zymi/memory";
 
 /// Returns true if a systemd service is installed and we're NOT already running inside it.
 fn has_systemd_service() -> bool {
     Path::new(SYSTEMD_UNIT).exists() && std::env::var("INVOCATION_ID").is_err()
+}
+
+/// When a systemd service is installed, load its .env so that API keys
+/// are available for interactive commands (login, setup, etc.).
+/// Does NOT change MEMORY_DIR — interactive commands write locally,
+/// then sync to the service dir via `sync_to_service()`.
+pub fn apply_systemd_env() {
+    if !has_systemd_service() {
+        return;
+    }
+    let env_path = Path::new(SYSTEMD_ENV_FILE);
+    if env_path.exists() {
+        dotenvy::from_path(env_path).ok();
+    }
+}
+
+/// Copy files from local memory_dir to the systemd service directory.
+/// Used after login/setup to sync config to where the service reads from.
+pub fn sync_to_service(memory_dir: &Path, files: &[&str]) {
+    if !has_systemd_service() {
+        return;
+    }
+    for file in files {
+        let src = memory_dir.join(file);
+        if !src.exists() {
+            continue;
+        }
+        let dst = format!("{}/{}", SYSTEMD_MEMORY_DIR, file);
+        let src_str = src.to_string_lossy();
+        if Command::new("sudo")
+            .args(["cp", &src_str, &dst])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            let _ = Command::new("sudo")
+                .args(["chown", "zymi:zymi", &dst])
+                .status();
+            println!("  Synced {file} → {dst}");
+        }
+    }
 }
 
 fn systemctl(args: &[&str]) -> bool {

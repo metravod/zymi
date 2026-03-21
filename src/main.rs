@@ -547,6 +547,7 @@ async fn shutdown_app(
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    daemon::apply_systemd_env();
     let cli = Cli::parse();
 
     // Lightweight commands — no heavy init needed
@@ -594,10 +595,12 @@ async fn main() -> Result<()> {
         } else {
             auth::login::login(&memory_dir).await?;
         }
+        daemon::sync_to_service(&memory_dir, &["auth.json", "models.json"]);
         return Ok(());
     }
     if let Some(Command::Logout) = &cli.command {
         auth::login::logout(&memory_dir);
+        daemon::sync_to_service(&memory_dir, &["auth.json"]);
         return Ok(());
     }
 

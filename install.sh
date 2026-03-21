@@ -99,7 +99,7 @@ detect_target() {
     arch="$(uname -m)"
 
     case "$os" in
-        Linux)  os="unknown-linux-gnu" ;;
+        Linux)  os="unknown-linux-musl" ;;
         Darwin) os="apple-darwin" ;;
         *)      red "Unsupported OS: $os"; exit 1 ;;
     esac
@@ -321,6 +321,14 @@ install_daemon() {
         # Helper: read existing value from .env
         env_val() { grep "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-; }
 
+        # When piped via curl|bash, stdin is the pipe (EOF).
+        # Read interactive input from /dev/tty instead.
+        if [ ! -t 0 ] && [ -e /dev/tty ]; then
+            exec 3</dev/tty
+        else
+            exec 3<&0
+        fi
+
         # Telegram token
         local cur_token
         cur_token="$(env_val TELOXIDE_TOKEN)"
@@ -330,7 +338,7 @@ install_daemon() {
         else
             printf "  Telegram bot token (from @BotFather): "
         fi
-        read -r input_token
+        read -r input_token <&3 || true
         local final_token="${input_token:-$cur_token}"
 
         # Allowed users
@@ -341,7 +349,7 @@ install_daemon() {
         else
             printf "  Allowed Telegram user IDs (comma-separated): "
         fi
-        read -r input_users
+        read -r input_users <&3 || true
         local final_users="${input_users:-$cur_users}"
 
         # LLM provider
@@ -353,7 +361,7 @@ install_daemon() {
         echo "    [4] Skip (configure manually later)"
         echo ""
         printf "  Choice [1]: "
-        read -r llm_choice
+        read -r llm_choice <&3 || true
         llm_choice="${llm_choice:-1}"
 
         local llm_key_name="" llm_key_val=""
@@ -367,7 +375,7 @@ install_daemon() {
                 else
                     printf "  OpenAI API key: "
                 fi
-                read -r input_key
+                read -r input_key <&3 || true
                 llm_key_val="${input_key:-$cur_openai}"
                 ;;
             2)
@@ -379,7 +387,7 @@ install_daemon() {
                 else
                     printf "  Anthropic API key: "
                 fi
-                read -r input_key
+                read -r input_key <&3 || true
                 llm_key_val="${input_key:-$cur_anthropic}"
                 ;;
             3)
@@ -391,6 +399,8 @@ install_daemon() {
                 echo "  Skipping LLM setup."
                 ;;
         esac
+
+        exec 3<&-
 
         # Save extra keys from old .env BEFORE overwriting
         local preserved=""

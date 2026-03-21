@@ -327,10 +327,12 @@ install_daemon() {
         # When piped via curl|bash, stdin is the pipe (EOF).
         # Read interactive input from /dev/tty instead.
         # If no tty available (non-interactive SSH), skip setup entirely.
+        # Note: /dev/tty may exist as a device node but fail to open
+        # when there is no controlling terminal, so we test with a trial open.
         if [ -t 0 ]; then
             exec 3<&0
-        elif [ -e /dev/tty ]; then
-            exec 3</dev/tty
+        elif exec 3</dev/tty 2>/dev/null; then
+            : # fd 3 is now open on /dev/tty
         else
             echo ""
             dim "  No interactive terminal available — skipping setup."

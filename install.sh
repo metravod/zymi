@@ -652,10 +652,12 @@ uninstall_daemon() {
         echo ""
         printf "  Delete %s? [y/N]: " "$DAEMON_INSTALL_DIR"
 
-        if [ ! -t 0 ] && [ -e /dev/tty ]; then
+        local confirm=""
+        if [ -e /dev/tty ]; then
             read -r confirm </dev/tty || true
         else
-            read -r confirm || true
+            # Non-interactive (e.g. ssh "cmd") — default to no
+            confirm=""
         fi
 
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then

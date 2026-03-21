@@ -580,7 +580,6 @@ fn step_systemd_service() {
         }
     };
 
-    let install_dir = Path::new("/opt/zymi");
     let zumi_user = "zymi";
     let zumi_group = "zymi";
 

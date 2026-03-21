@@ -305,9 +305,9 @@ install_daemon() {
     else
         # Check if required keys are set
         local has_token has_users has_llm
-        has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$ENV_FILE" 2>/dev/null || echo 0)"
-        has_users="$(grep -c '^ALLOWED_USERS=.\+' "$ENV_FILE" 2>/dev/null || echo 0)"
-        has_llm="$(grep -cE '^(OPENAI_API_KEY|ANTHROPIC_API_KEY)=.\+' "$ENV_FILE" 2>/dev/null || echo 0)"
+        has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$ENV_FILE" 2>/dev/null)" || has_token=0
+        has_users="$(grep -c '^ALLOWED_USERS=.\+' "$ENV_FILE" 2>/dev/null)" || has_users=0
+        has_llm="$(grep -cE '^(OPENAI_API_KEY|ANTHROPIC_API_KEY)=.\+' "$ENV_FILE" 2>/dev/null)" || has_llm=0
         if [ "$has_token" -eq 0 ] || [ "$has_users" -eq 0 ] || [ "$has_llm" -eq 0 ]; then
             NEEDS_SETUP=true
         fi
@@ -519,11 +519,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=forking
+PIDFile=/opt/zymi/.zymi.pid
 User=zymi
 Group=zymi
 WorkingDirectory=/opt/zymi
-ExecStart=/usr/local/bin/zymi serve
+ExecStart=/usr/local/bin/zymi
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
@@ -585,8 +586,8 @@ UNIT
     # ── Auto-start / restart ─────────────────────────────────────────
 
     local has_token has_users
-    has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null || echo 0)"
-    has_users="$(grep -c '^ALLOWED_USERS=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null || echo 0)"
+    has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null)" || has_token=0
+    has_users="$(grep -c '^ALLOWED_USERS=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null)" || has_users=0
 
     echo ""
     if [ "$has_token" -gt 0 ] && [ "$has_users" -gt 0 ]; then

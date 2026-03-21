@@ -5,6 +5,7 @@ GITHUB_REPO="metravod/zymi"
 INSTALL_DIR="${HOME}/.local/bin"
 DAEMON_INSTALL_DIR="/opt/zymi"
 DAEMON_MODE=false
+UNINSTALL_MODE=false
 SOURCE_BUILD=false
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -12,9 +13,10 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
 
 usage() {
-    echo "Usage: install.sh [--daemon]"
+    echo "Usage: install.sh [--daemon] [--uninstall]"
     echo ""
-    echo "  --daemon   Install as systemd service (requires root)"
+    echo "  --daemon      Install as systemd service (requires root)"
+    echo "  --uninstall   Remove zymi (auto-detects daemon vs user install)"
     echo ""
     echo "Without --daemon: installs binary to ~/.local/bin"
     echo "With --daemon:    installs binary + systemd service to /opt/zymi"
@@ -27,9 +29,10 @@ usage() {
 
 for arg in "$@"; do
     case "$arg" in
-        --daemon)  DAEMON_MODE=true ;;
-        --help|-h) usage; exit 0 ;;
-        *)         red "Unknown option: $arg"; usage; exit 1 ;;
+        --daemon)    DAEMON_MODE=true ;;
+        --uninstall) UNINSTALL_MODE=true ;;
+        --help|-h)   usage; exit 0 ;;
+        *)           red "Unknown option: $arg"; usage; exit 1 ;;
     esac
 done
 
@@ -609,7 +612,104 @@ UNIT
     fi
 }
 
+# ─── Uninstall ─────────────────────────────────────────────────────────
+
+uninstall_daemon() {
+    echo "Uninstalling Zymi daemon..."
+    echo ""
+
+    # Stop and disable service
+    if systemctl is-active --quiet zymi.service 2>/dev/null; then
+        echo "Stopping zymi service..."
+        systemctl stop zymi.service
+    fi
+    if systemctl is-enabled --quiet zymi.service 2>/dev/null; then
+        systemctl disable zymi.service
+    fi
+    if [ -f /etc/systemd/system/zymi.service ]; then
+        rm /etc/systemd/system/zymi.service
+        systemctl daemon-reload
+        green "  Removed systemd service"
+    fi
+
+    # Remove binary
+    if [ -f /usr/local/bin/zymi ]; then
+        rm /usr/local/bin/zymi
+        green "  Removed /usr/local/bin/zymi"
+    fi
+
+    # Remove sudoers
+    if [ -f /etc/sudoers.d/zymi ]; then
+        rm /etc/sudoers.d/zymi
+        green "  Removed sudoers rules"
+    fi
+
+    # Remove data directory
+    if [ -d "$DAEMON_INSTALL_DIR" ]; then
+        echo ""
+        echo "  Data directory: $DAEMON_INSTALL_DIR"
+        dim "    Contains: .env, memory/, conversation history"
+        echo ""
+        printf "  Delete %s? [y/N]: " "$DAEMON_INSTALL_DIR"
+
+        if [ ! -t 0 ] && [ -e /dev/tty ]; then
+            read -r confirm </dev/tty || true
+        else
+            read -r confirm || true
+        fi
+
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+            rm -rf "$DAEMON_INSTALL_DIR"
+            green "  Removed $DAEMON_INSTALL_DIR"
+        else
+            dim "  Kept $DAEMON_INSTALL_DIR"
+        fi
+    fi
+
+    # Remove system user and group
+    if id zymi &>/dev/null; then
+        userdel zymi
+        green "  Removed system user 'zymi'"
+    fi
+    if getent group zymi &>/dev/null; then
+        groupdel zymi 2>/dev/null || true
+        green "  Removed system group 'zymi'"
+    fi
+
+    echo ""
+    green "Zymi daemon uninstalled."
+}
+
+uninstall_user() {
+    echo "Uninstalling Zymi..."
+    echo ""
+
+    if [ -f "$INSTALL_DIR/zymi" ]; then
+        rm "$INSTALL_DIR/zymi"
+        green "  Removed $INSTALL_DIR/zymi"
+    else
+        dim "  Binary not found at $INSTALL_DIR/zymi"
+    fi
+
+    echo ""
+    green "Zymi uninstalled."
+}
+
 # ─── Main ────────────────────────────────────────────────────────────
+
+if [ "$UNINSTALL_MODE" = true ]; then
+    # Auto-detect: daemon install exists?
+    if [ -f /etc/systemd/system/zymi.service ] || [ -d "$DAEMON_INSTALL_DIR" ] || [ -f /usr/local/bin/zymi ]; then
+        if [ "$(id -u)" -ne 0 ]; then
+            red "Error: uninstalling daemon requires root (use sudo)"
+            exit 1
+        fi
+        uninstall_daemon
+    else
+        uninstall_user
+    fi
+    exit 0
+fi
 
 check_deps
 

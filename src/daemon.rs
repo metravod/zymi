@@ -6,6 +6,21 @@ use std::process::{self, Command, Stdio};
 const PID_FILE: &str = ".zymi.pid";
 const LOG_FILE: &str = "zymi.log"; // relative to memory_dir
 const GITHUB_REPO: &str = "metravod/zymi";
+const SYSTEMD_UNIT: &str = "/etc/systemd/system/zymi.service";
+
+/// Returns true if a systemd service is installed for zymi.
+fn has_systemd_service() -> bool {
+    Path::new(SYSTEMD_UNIT).exists()
+}
+
+fn systemctl(args: &[&str]) -> bool {
+    Command::new("sudo")
+        .arg("systemctl")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 fn memory_dir() -> String {
     std::env::var("MEMORY_DIR").unwrap_or_else(|_| "./memory".to_string())
@@ -53,6 +68,36 @@ fn kill_pid(pid: u32, signal: &str) {
 }
 
 pub fn start() {
+    if has_systemd_service() {
+        // Check if already running
+        let already_running = Command::new("systemctl")
+            .args(["is-active", "--quiet", "zymi.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if already_running {
+            println!("Zymi is already running.");
+            let _ = Command::new("systemctl")
+                .args(["status", "--no-pager", "zymi.service"])
+                .status();
+            return;
+        }
+
+        println!("Starting zymi via systemd...");
+        if systemctl(&["start", "zymi.service"]) {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = Command::new("systemctl")
+                .args(["status", "--no-pager", "zymi.service"])
+                .status();
+        } else {
+            eprintln!("Failed to start. Check: sudo journalctl -u zymi -n 30");
+            process::exit(1);
+        }
+        return;
+    }
+
+    // No systemd — direct daemon mode
     if is_running() {
         let pid = read_pid().unwrap();
         println!("Zymi is already running (PID {pid}).");
@@ -117,6 +162,17 @@ pub fn start() {
 }
 
 pub fn stop() {
+    if has_systemd_service() {
+        println!("Stopping zymi via systemd...");
+        if systemctl(&["stop", "zymi.service"]) {
+            println!("Zymi stopped.");
+        } else {
+            eprintln!("Failed to stop zymi service.");
+            process::exit(1);
+        }
+        return;
+    }
+
     let pid = match read_pid() {
         Some(pid) if is_pid_alive(pid) => pid,
         _ => {
@@ -158,6 +214,13 @@ pub fn stop() {
 }
 
 pub fn status() {
+    if has_systemd_service() {
+        let _ = Command::new("systemctl")
+            .args(["status", "--no-pager", "zymi.service"])
+            .status();
+        return;
+    }
+
     match read_pid() {
         Some(pid) if is_pid_alive(pid) => println!("Zymi is running (PID {pid})."),
         _ => {
@@ -168,6 +231,13 @@ pub fn status() {
 }
 
 pub fn logs() {
+    if has_systemd_service() {
+        let _ = Command::new("journalctl")
+            .args(["-u", "zymi", "-f", "-n", "50"])
+            .status();
+        return;
+    }
+
     let log = log_path();
 
     if !log.exists() {

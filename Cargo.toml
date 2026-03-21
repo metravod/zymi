@@ -1,6 +1,6 @@
 [package]
 name = "zymi"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Autonomous AI agent with tool use, workflow engine, and long-term memory"
 repository = "https://github.com/metravod/zymi"

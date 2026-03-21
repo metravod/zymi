@@ -172,7 +172,7 @@ pub async fn run(
     audit: AuditLog,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let bot = Bot::from_env();
+    let bot = crate::connectors::telegram::bot_with_timeout();
     log::info!("Scheduler started");
 
     loop {

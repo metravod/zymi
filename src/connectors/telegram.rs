@@ -17,6 +17,23 @@ use crate::tools::ask_user::UserQuestion;
 
 const TELEGRAM_MSG_LIMIT: usize = 4096;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout for Telegram API calls (send_message, send_chat_action, etc.).
+/// Prevents hung TCP connections from blocking the handler (and all queued messages)
+/// indefinitely due to teloxide's per-chat serialization.
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn bot_with_timeout() -> Bot {
+    let client = reqwest::Client::builder()
+        .timeout(API_TIMEOUT)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client");
+    Bot::with_client(
+        std::env::var("TELOXIDE_TOKEN")
+            .expect("TELOXIDE_TOKEN must be set"),
+        client,
+    )
+}
 
 /// Escape special HTML characters for Telegram HTML parse mode.
 pub fn escape_html(s: &str) -> String {
@@ -289,7 +306,7 @@ pub async fn run(
     shared_approval: SharedApprovalHandler,
     ask_user_rx: mpsc::UnboundedReceiver<UserQuestion>,
 ) {
-    let bot = Bot::from_env();
+    let bot = bot_with_timeout();
     let allowed_users = match allowed_users() {
         Ok(users) => users,
         Err(e) => {
@@ -572,8 +589,10 @@ async fn gpt_handler(
         };
     }
 
-    bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-        .await?;
+    // Typing indicator is cosmetic — don't let it block the handler
+    if let Err(e) = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await {
+        log::warn!("send_chat_action failed: {e}");
+    }
 
     let conversation_id = format!("telegram:{}", chat_id.0);
     let approval_handler: Arc<dyn ApprovalHandler> =

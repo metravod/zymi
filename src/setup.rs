@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 use crate::core::config::{load_models_config, save_models_config, ModelEntry, ModelsConfig, ProviderType};
 
@@ -165,6 +167,10 @@ pub fn run_setup(memory_dir: &Path) -> bool {
     for (key, value) in &env_vars {
         std::env::set_var(key, value);
     }
+
+    // Offer systemd service installation (Linux only)
+    #[cfg(target_os = "linux")]
+    step_systemd_service();
 
     print_complete_banner();
     true
@@ -533,6 +539,169 @@ fn step_git_backup(memory_dir: &Path) {
 
     println!();
     println!("  \x1b[1;32m+\x1b[0m Git backup configured!");
+}
+
+// ============================================================
+// Step: systemd service (Linux only)
+// ============================================================
+
+#[cfg(target_os = "linux")]
+fn step_systemd_service() {
+    println!();
+    println!("  \x1b[1;36m─── Systemd Service ───────────────────────\x1b[0m");
+    println!();
+    println!("  Install zymi as a systemd service?");
+    println!("  This will create a dedicated system user, configure");
+    println!("  sudoers for healthchecks, and enable auto-start.");
+    println!("  \x1b[2mRequires sudo.\x1b[0m");
+    println!();
+
+    if !confirm("  Install systemd service?", false) {
+        println!("  \x1b[2mSkipped. You can re-run `zymi setup` later.\x1b[0m");
+        return;
+    }
+
+    // Check if we can get sudo
+    let sudo_check = Command::new("sudo").args(["-n", "true"]).output();
+    let has_sudo = sudo_check.map(|o| o.status.success()).unwrap_or(false);
+
+    if !has_sudo {
+        println!();
+        println!("  \x1b[2mSudo requires a password. Re-run setup with sudo:\x1b[0m");
+        println!("  \x1b[1msudo zymi setup\x1b[0m");
+        return;
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("  \x1b[31mCannot determine working directory: {e}\x1b[0m");
+            return;
+        }
+    };
+
+    let install_dir = Path::new("/opt/zymi");
+    let zumi_user = "zymi";
+    let zumi_group = "zymi";
+
+    // Create system user & group
+    if !user_exists(zumi_user) {
+        run_sudo(&["groupadd", "--system", zumi_group]);
+        run_sudo(&["useradd", "--system",
+            "--gid", zumi_group,
+            "--shell", "/usr/sbin/nologin",
+            "--home-dir", "/opt/zymi",
+            "--no-create-home",
+            zumi_user,
+        ]);
+        println!("  \x1b[1;32m+\x1b[0m Created system user '{zumi_user}'");
+    } else {
+        println!("  \x1b[2m  User '{zumi_user}' already exists\x1b[0m");
+    }
+
+    // Add to supplementary groups
+    for group in &["docker", "adm", "systemd-journal"] {
+        if group_exists(group) {
+            run_sudo(&["usermod", "-aG", group, zumi_user]);
+        }
+    }
+
+    // Create directory structure
+    run_sudo(&["mkdir", "-p", "/opt/zymi/memory"]);
+    for sub in &["baseline", "subagents", "evals", "eval_results", "workflow_scripts", "workflow_traces"] {
+        run_sudo(&["mkdir", "-p", &format!("/opt/zymi/memory/{sub}")]);
+    }
+
+    // Copy current config to /opt/zymi
+    let env_src = cwd.join(".env");
+    if env_src.exists() {
+        run_sudo(&["cp", &env_src.to_string_lossy(), "/opt/zymi/.env"]);
+        run_sudo(&["chmod", "600", "/opt/zymi/.env"]);
+    }
+
+    // Copy models.json and auth.json if present
+    let memory_dir_path = cwd.join("memory");
+    for file in &["models.json", "auth.json", "AGENT.md"] {
+        let src = memory_dir_path.join(file);
+        if src.exists() {
+            run_sudo(&["cp", &src.to_string_lossy(), &format!("/opt/zymi/memory/{file}")]);
+        }
+    }
+
+    // Set ownership
+    run_sudo(&["chown", "-R", &format!("{zumi_user}:{zumi_group}"), "/opt/zymi"]);
+    run_sudo(&["chmod", "750", "/opt/zymi"]);
+    run_sudo(&["chmod", "700", "/opt/zymi/memory"]);
+
+    // Sudoers
+    let sudoers = include_str!("../assets/sudoers.conf");
+    let sudoers_path = "/etc/sudoers.d/zymi";
+    if write_via_sudo(sudoers_path, sudoers) {
+        run_sudo(&["chmod", "440", sudoers_path]);
+        let check = Command::new("sudo")
+            .args(["visudo", "-c", "-f", sudoers_path])
+            .output();
+        if check.map(|o| o.status.success()).unwrap_or(false) {
+            println!("  \x1b[1;32m+\x1b[0m Sudoers configured");
+        } else {
+            println!("  \x1b[33m!\x1b[0m Sudoers syntax error, removing");
+            run_sudo(&["rm", "-f", sudoers_path]);
+        }
+    }
+
+    // systemd unit
+    let unit = include_str!("../assets/zymi.service");
+    if write_via_sudo("/etc/systemd/system/zymi.service", unit) {
+        run_sudo(&["systemctl", "daemon-reload"]);
+        run_sudo(&["systemctl", "enable", "zymi.service"]);
+        println!("  \x1b[1;32m+\x1b[0m Systemd service installed and enabled");
+    }
+
+    println!();
+    println!("  Start with: \x1b[1msudo systemctl start zymi\x1b[0m");
+    println!("  Logs:       \x1b[1msudo journalctl -u zymi -f\x1b[0m");
+}
+
+#[cfg(target_os = "linux")]
+fn run_sudo(args: &[&str]) -> bool {
+    Command::new("sudo")
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn write_via_sudo(path: &str, content: &str) -> bool {
+    let mut child = match Command::new("sudo")
+        .args(["tee", path])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = io::Write::write_all(stdin, content.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn user_exists(name: &str) -> bool {
+    Command::new("id").arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn group_exists(name: &str) -> bool {
+    Command::new("getent").args(["group", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 // ============================================================

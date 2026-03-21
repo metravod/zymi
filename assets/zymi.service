@@ -1,0 +1,52 @@
+[Unit]
+Description=Zymi AI Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/opt/zymi/.zymi.pid
+User=zymi
+Group=zymi
+WorkingDirectory=/opt/zymi
+ExecStart=/usr/local/bin/zymi
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+# Environment
+EnvironmentFile=-/opt/zymi/.env
+Environment=RUST_LOG=info
+Environment=MEMORY_DIR=/opt/zymi/memory
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/zymi
+PrivateTmp=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# /proc access for healthchecks
+ProcSubset=all
+ProtectProc=default
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+TasksMax=256
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zymi
+
+[Install]
+WantedBy=multi-user.target

@@ -2,9 +2,7 @@
 set -euo pipefail
 
 GITHUB_REPO="metravod/zymi"
-INSTALL_DIR="${HOME}/.local/bin"
-DAEMON_INSTALL_DIR="/opt/zymi"
-DAEMON_MODE=false
+INSTALL_DIR="/usr/local/bin"
 UNINSTALL_MODE=false
 SOURCE_BUILD=false
 
@@ -13,13 +11,12 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
 
 usage() {
-    echo "Usage: install.sh [--daemon] [--uninstall]"
+    echo "Usage: install.sh [--uninstall]"
     echo ""
-    echo "  --daemon      Install as systemd service (requires root)"
-    echo "  --uninstall   Remove zymi (auto-detects daemon vs user install)"
+    echo "  --uninstall   Remove zymi (binary + systemd service if present)"
     echo ""
-    echo "Without --daemon: installs binary to ~/.local/bin"
-    echo "With --daemon:    installs binary + systemd service to /opt/zymi"
+    echo "Installs the zymi binary to /usr/local/bin (requires root)."
+    echo "After install, run 'zymi setup' to configure."
     echo ""
     echo "If run from the zymi source tree (Cargo.toml present),"
     echo "builds from source instead of downloading a release."
@@ -29,17 +26,11 @@ usage() {
 
 for arg in "$@"; do
     case "$arg" in
-        --daemon)    DAEMON_MODE=true ;;
         --uninstall) UNINSTALL_MODE=true ;;
         --help|-h)   usage; exit 0 ;;
         *)           red "Unknown option: $arg"; usage; exit 1 ;;
     esac
 done
-
-if [ "$DAEMON_MODE" = true ] && [ "$(id -u)" -ne 0 ]; then
-    red "Error: --daemon requires root (use sudo)"
-    exit 1
-fi
 
 # ─── Source tree detection ─────────────────────────────────────────────
 
@@ -65,10 +56,6 @@ check_deps() {
         if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
             missing+=("sha256sum or shasum")
         fi
-    fi
-
-    if [ "$DAEMON_MODE" = true ]; then
-        command -v systemctl &>/dev/null || missing+=(systemctl)
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then
@@ -195,444 +182,56 @@ download_binary() {
     fi
 }
 
-# ─── Install modes ──────────────────────────────────────────────────
+# ─── Install ─────────────────────────────────────────────────────────
 
-install_user() {
-    mkdir -p "$INSTALL_DIR"
+install_binary() {
+    if [ "$(id -u)" -ne 0 ]; then
+        red "Error: install requires root (use sudo)"
+        exit 1
+    fi
+
+    # Stop service if running (upgrade case)
+    if systemctl is-active --quiet zymi.service 2>/dev/null; then
+        echo "Stopping running zymi service..."
+        systemctl stop zymi.service
+    fi
+
     cp "$NEW_BIN" "$INSTALL_DIR/zymi"
-    chmod +x "$INSTALL_DIR/zymi"
+    chmod 755 "$INSTALL_DIR/zymi"
 
     green "Installed zymi $LATEST to $INSTALL_DIR/zymi"
-
-    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-        echo ""
-        echo "Add ~/.local/bin to your PATH:"
-        echo ""
-
-        SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-        case "$SHELL_NAME" in
-            zsh)
-                dim "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
-                dim "  source ~/.zshrc"
-                ;;
-            *)
-                dim "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
-                dim "  source ~/.bashrc"
-                ;;
-        esac
-    fi
-
     echo ""
     echo "Get started:"
-    echo "  zymi setup    # first-time setup wizard"
-    echo "  zymi          # start daemon (Telegram + scheduler + healthcheck)"
-    echo "  zymi cli      # interactive TUI mode"
-}
+    echo "  zymi setup    # configure Telegram, API keys, systemd service"
+    echo "  zymi          # start daemon"
+    echo "  zymi cli      # interactive TUI"
 
-install_daemon() {
-    local ZUMI_USER="zymi"
-    local ZUMI_GROUP="zymi"
-
-    # ── Create system user & group ───────────────────────────────────
-
-    if ! getent group "$ZUMI_GROUP" &>/dev/null; then
-        echo "Creating system group '$ZUMI_GROUP'..."
-        groupadd --system "$ZUMI_GROUP"
-    fi
-
-    if ! id "$ZUMI_USER" &>/dev/null; then
-        echo "Creating system user '$ZUMI_USER'..."
-        useradd --system \
-            --gid "$ZUMI_GROUP" \
-            --shell /usr/sbin/nologin \
-            --home-dir "$DAEMON_INSTALL_DIR" \
-            --no-create-home \
-            "$ZUMI_USER"
-    fi
-
-    # ── Add to supplementary groups (if they exist) ──────────────────
-
-    # docker — container management via /var/run/docker.sock
-    # NOTE: docker group grants broad API access. Privilege escalation
-    # vectors (--privileged, host root mounts, --pid=host, --cap-add=ALL)
-    # are blocked by zymi's built-in policy engine (check_dangerous in policy.rs).
-    if getent group docker &>/dev/null; then
-        usermod -aG docker "$ZUMI_USER"
-        echo "  Added $ZUMI_USER to docker group"
-    fi
-
-    # adm — read /var/log/* and journalctl access
-    if getent group adm &>/dev/null; then
-        usermod -aG adm "$ZUMI_USER"
-        echo "  Added $ZUMI_USER to adm group"
-    fi
-
-    # systemd-journal — journalctl on systems without adm
-    if getent group systemd-journal &>/dev/null; then
-        usermod -aG systemd-journal "$ZUMI_USER"
-        echo "  Added $ZUMI_USER to systemd-journal group"
-    fi
-
-    # ── Create directory structure ───────────────────────────────────
-
-    mkdir -p "$DAEMON_INSTALL_DIR/memory"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/baseline"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/subagents"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/evals"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/eval_results"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/workflow_scripts"
-    mkdir -p "$DAEMON_INSTALL_DIR/memory/workflow_traces"
-
-    # Install binary
-    cp "$NEW_BIN" /usr/local/bin/zymi
-    chmod 755 /usr/local/bin/zymi
-
-    # Set ownership and permissions
-    chown -R "$ZUMI_USER:$ZUMI_GROUP" "$DAEMON_INSTALL_DIR"
-    chmod 750 "$DAEMON_INSTALL_DIR"
-    chmod 700 "$DAEMON_INSTALL_DIR/memory"
-
-    # ── Interactive .env setup ───────────────────────────────────────
-
-    local ENV_FILE="$DAEMON_INSTALL_DIR/.env"
-    local NEEDS_SETUP=false
-
-    if [ ! -f "$ENV_FILE" ]; then
-        NEEDS_SETUP=true
-        touch "$ENV_FILE"
-        chown "$ZUMI_USER:$ZUMI_GROUP" "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-    else
-        # Check if required keys are set
-        local has_token has_users has_llm
-        has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$ENV_FILE" 2>/dev/null)" || has_token=0
-        has_users="$(grep -c '^ALLOWED_USERS=.\+' "$ENV_FILE" 2>/dev/null)" || has_users=0
-        has_llm="$(grep -cE '^(OPENAI_API_KEY|ANTHROPIC_API_KEY)=.\+' "$ENV_FILE" 2>/dev/null)" || has_llm=0
-        if [ "$has_token" -eq 0 ] || [ "$has_users" -eq 0 ] || [ "$has_llm" -eq 0 ]; then
-            NEEDS_SETUP=true
-        fi
-    fi
-
-    if [ "$NEEDS_SETUP" = true ]; then
+    # Restart service if it was installed
+    if [ -f /etc/systemd/system/zymi.service ]; then
         echo ""
-        echo "─── Configuration ─────────────────────────────────────────"
-        echo ""
-        echo "Zymi needs a Telegram bot token, allowed user IDs, and an LLM API key."
-        echo "Press Enter to keep the current value (shown in brackets)."
-        echo ""
-
-        # Helper: read existing value from .env
-        env_val() { grep "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-; }
-
-        # When piped via curl|bash, stdin is the pipe (EOF).
-        # Read interactive input from /dev/tty instead.
-        # If no tty available (non-interactive SSH), skip setup entirely.
-        # Note: /dev/tty may exist as a device node but fail to open
-        # when there is no controlling terminal, so we test with a trial open.
-        if [ -t 0 ]; then
-            exec 3<&0
-        elif exec 3</dev/tty 2>/dev/null; then
-            : # fd 3 is now open on /dev/tty
-        else
-            echo ""
-            dim "  No interactive terminal available — skipping setup."
-            echo ""
-            echo "  Configure manually:"
-            dim "    sudo nano $ENV_FILE"
-            dim "    sudo systemctl restart zymi"
-            NEEDS_SETUP=false
-        fi
-    fi
-
-    if [ "$NEEDS_SETUP" = true ]; then
-        # Telegram token
-        local cur_token
-        cur_token="$(env_val TELOXIDE_TOKEN)"
-        if [ -n "$cur_token" ]; then
-            local masked="${cur_token:0:8}...${cur_token: -4}"
-            printf "  Telegram bot token [%s]: " "$masked"
-        else
-            printf "  Telegram bot token (from @BotFather): "
-        fi
-        read -r input_token <&3 || true
-        local final_token="${input_token:-$cur_token}"
-
-        # Allowed users
-        local cur_users
-        cur_users="$(env_val ALLOWED_USERS)"
-        if [ -n "$cur_users" ]; then
-            printf "  Allowed Telegram user IDs [%s]: " "$cur_users"
-        else
-            printf "  Allowed Telegram user IDs (comma-separated): "
-        fi
-        read -r input_users <&3 || true
-        local final_users="${input_users:-$cur_users}"
-
-        # LLM provider
-        echo ""
-        echo "  LLM provider:"
-        echo "    [1] OpenAI (OPENAI_API_KEY)"
-        echo "    [2] Anthropic (ANTHROPIC_API_KEY)"
-        echo "    [3] ChatGPT Plus/Pro (OAuth — configured after install)"
-        echo "    [4] Skip (configure manually later)"
-        echo ""
-        printf "  Choice [1]: "
-        read -r llm_choice <&3 || true
-        llm_choice="${llm_choice:-1}"
-
-        local llm_key_name="" llm_key_val=""
-        case "$llm_choice" in
-            1)
-                llm_key_name="OPENAI_API_KEY"
-                local cur_openai
-                cur_openai="$(env_val OPENAI_API_KEY)"
-                if [ -n "$cur_openai" ]; then
-                    printf "  OpenAI API key [%s...]: " "${cur_openai:0:8}"
-                else
-                    printf "  OpenAI API key: "
-                fi
-                read -r input_key <&3 || true
-                llm_key_val="${input_key:-$cur_openai}"
-                ;;
-            2)
-                llm_key_name="ANTHROPIC_API_KEY"
-                local cur_anthropic
-                cur_anthropic="$(env_val ANTHROPIC_API_KEY)"
-                if [ -n "$cur_anthropic" ]; then
-                    printf "  Anthropic API key [%s...]: " "${cur_anthropic:0:8}"
-                else
-                    printf "  Anthropic API key: "
-                fi
-                read -r input_key <&3 || true
-                llm_key_val="${input_key:-$cur_anthropic}"
-                ;;
-            3)
-                echo ""
-                echo "  ChatGPT OAuth: run after install:"
-                dim "    sudo -u zymi zymi login --remote"
-                ;;
-            *)
-                echo "  Skipping LLM setup."
-                ;;
-        esac
-
-        exec 3<&-
-
-        # Save extra keys from old .env BEFORE overwriting
-        local preserved=""
-        for extra_key in TAVILY_API_KEY FIRECRAWL_API_KEY BLAND_API_KEY SUPADATA_API_KEY \
-                         LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY ANTHROPIC_API_KEY OPENAI_API_KEY; do
-            [ "$extra_key" = "$llm_key_name" ] && continue
-            local extra_val
-            extra_val="$(env_val "$extra_key")"
-            if [ -n "$extra_val" ]; then
-                preserved="${preserved}${extra_key}=${extra_val}\n"
-            fi
-        done
-
-        # Write .env
-        cat > "$ENV_FILE" << ENVFILE
-# Telegram bot
-TELOXIDE_TOKEN=${final_token}
-ALLOWED_USERS=${final_users}
-
-# LLM provider
-${llm_key_name:+${llm_key_name}=${llm_key_val}}
-ENVFILE
-
-        # Append preserved keys
-        if [ -n "$preserved" ]; then
-            printf "%b" "$preserved" >> "$ENV_FILE"
-        fi
-
-        chown "$ZUMI_USER:$ZUMI_GROUP" "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-
-        echo ""
-        green "  Configuration saved to $ENV_FILE"
-    fi
-
-    # ── Sudoers for healthcheck commands ─────────────────────────────
-
-    echo "Configuring sudoers for healthcheck commands..."
-    cat > /etc/sudoers.d/zymi << 'SUDOERS'
-# Zymi daemon — read-only system introspection for healthchecks
-# No password required for these specific commands
-#
-# NOTE: journalctl is NOT here — adm/systemd-journal group membership
-# already grants read access to the journal without privilege escalation.
-
-# Crontab inspection (root's crontab)
-zymi ALL=(ALL) NOPASSWD: /usr/bin/crontab -l
-
-# Disk health (S.M.A.R.T)
-zymi ALL=(ALL) NOPASSWD: /usr/sbin/smartctl -a *
-zymi ALL=(ALL) NOPASSWD: /usr/sbin/smartctl -H *
-zymi ALL=(ALL) NOPASSWD: /usr/sbin/smartctl --scan
-
-# Kernel messages (OOM, hardware errors)
-zymi ALL=(ALL) NOPASSWD: /usr/bin/dmesg
-zymi ALL=(ALL) NOPASSWD: /usr/bin/dmesg --level=err\,warn
-zymi ALL=(ALL) NOPASSWD: /usr/bin/dmesg -T
-
-# Security updates check
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt list --upgradable
-zymi ALL=(ALL) NOPASSWD: /usr/bin/yum check-update
-
-# Package management (human approves via Telegram policy engine)
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt update
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt install *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt upgrade *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt remove *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt-get update
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt-get install *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt-get upgrade *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/apt-get remove *
-
-# Service management (human approves via Telegram policy engine)
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl start *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl status *
-zymi ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
-
-# NOTE: Docker access is via docker group membership, not sudoers.
-# Privilege escalation vectors (--privileged, host root mounts, etc.)
-# are blocked by zymi's built-in policy engine.
-SUDOERS
-    chmod 440 /etc/sudoers.d/zymi
-
-    # Validate sudoers syntax
-    if ! visudo -c -f /etc/sudoers.d/zymi &>/dev/null; then
-        red "Warning: sudoers file has syntax errors, removing it"
-        rm -f /etc/sudoers.d/zymi
-    else
-        green "  Sudoers configured"
-    fi
-
-    # ── systemd service ──────────────────────────────────────────────
-
-    cat > /etc/systemd/system/zymi.service << 'UNIT'
-[Unit]
-Description=Zymi AI Agent Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-PIDFile=/opt/zymi/.zymi.pid
-User=zymi
-Group=zymi
-WorkingDirectory=/opt/zymi
-ExecStart=/usr/local/bin/zymi
-Restart=on-failure
-RestartSec=10
-TimeoutStopSec=30
-
-# Environment
-EnvironmentFile=-/opt/zymi/.env
-Environment=RUST_LOG=info
-Environment=MEMORY_DIR=/opt/zymi/memory
-
-# Security hardening
-# NOTE: NoNewPrivileges is intentionally OFF — healthcheck commands
-# use sudo for read-only introspection (smartctl, dmesg, docker).
-# setuid is required for sudo to work.
-# NOTE: ProtectKernelLogs is intentionally OFF — dmesg needs CAP_SYSLOG
-# which systemd strips when ProtectKernelLogs=true.
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/zymi
-PrivateTmp=true
-ProtectClock=true
-ProtectHostname=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictRealtime=true
-RestrictNamespaces=true
-LockPersonality=true
-SystemCallArchitectures=native
-
-# /proc access for healthchecks
-ProcSubset=all
-ProtectProc=default
-
-# Resource limits
-LimitNOFILE=65536
-MemoryMax=512M
-TasksMax=256
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=zymi
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable zymi.service
-
-    green "Installed zymi $LATEST as systemd service"
-    echo ""
-    echo "  User:      $ZUMI_USER ($(id -nG "$ZUMI_USER" 2>/dev/null || echo "$ZUMI_GROUP"))"
-    echo "  Home:      $DAEMON_INSTALL_DIR"
-    echo "  Config:    $DAEMON_INSTALL_DIR/.env"
-    echo "  Sudoers:   /etc/sudoers.d/zymi"
-    echo "  Service:   zymi.service"
-
-    # ── Auto-start / restart ─────────────────────────────────────────
-
-    local has_token has_users
-    has_token="$(grep -c '^TELOXIDE_TOKEN=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null)" || has_token=0
-    has_users="$(grep -c '^ALLOWED_USERS=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null)" || has_users=0
-
-    echo ""
-    if [ "$has_token" -gt 0 ] && [ "$has_users" -gt 0 ]; then
-        if systemctl is-active --quiet zymi.service 2>/dev/null; then
-            echo "Restarting zymi..."
-            systemctl restart zymi.service
-        else
-            echo "Starting zymi..."
-            systemctl start zymi.service
-        fi
+        echo "Restarting zymi service..."
+        systemctl start zymi.service
         sleep 2
         if systemctl is-active --quiet zymi.service 2>/dev/null; then
             green "Zymi is running."
-            dim "  sudo journalctl -u zymi -f"
         else
-            red "Zymi failed to start. Check logs:"
-            dim "  sudo journalctl -u zymi --no-pager -n 30"
+            red "Zymi failed to start. Check: sudo journalctl -u zymi -n 30"
         fi
-    else
-        echo "Telegram not configured — skipping auto-start."
-        echo ""
-        echo "To configure later:"
-        dim "  sudo nano $DAEMON_INSTALL_DIR/.env"
-        dim "  sudo systemctl start zymi"
-    fi
-
-    # ChatGPT OAuth hint
-    if grep -qE '^(OPENAI_API_KEY|ANTHROPIC_API_KEY)=.\+' "$DAEMON_INSTALL_DIR/.env" 2>/dev/null; then
-        : # LLM key present, no hint needed
-    else
-        echo ""
-        echo "ChatGPT OAuth login:"
-        dim "  sudo -u zymi zymi login --remote"
     fi
 }
 
 # ─── Uninstall ─────────────────────────────────────────────────────────
 
-uninstall_daemon() {
-    echo "Uninstalling Zymi daemon..."
+uninstall() {
+    if [ "$(id -u)" -ne 0 ]; then
+        red "Error: uninstall requires root (use sudo)"
+        exit 1
+    fi
+
+    echo "Uninstalling Zymi..."
     echo ""
 
-    # Stop and disable service
+    # Stop and remove systemd service
     if systemctl is-active --quiet zymi.service 2>/dev/null; then
         echo "Stopping zymi service..."
         systemctl stop zymi.service
@@ -647,9 +246,9 @@ uninstall_daemon() {
     fi
 
     # Remove binary
-    if [ -f /usr/local/bin/zymi ]; then
-        rm /usr/local/bin/zymi
-        green "  Removed /usr/local/bin/zymi"
+    if [ -f "$INSTALL_DIR/zymi" ]; then
+        rm "$INSTALL_DIR/zymi"
+        green "  Removed $INSTALL_DIR/zymi"
     fi
 
     # Remove sudoers
@@ -659,26 +258,24 @@ uninstall_daemon() {
     fi
 
     # Remove data directory
-    if [ -d "$DAEMON_INSTALL_DIR" ]; then
+    if [ -d /opt/zymi ]; then
         echo ""
-        echo "  Data directory: $DAEMON_INSTALL_DIR"
+        echo "  Data directory: /opt/zymi"
         dim "    Contains: .env, memory/, conversation history"
         echo ""
-        printf "  Delete %s? [y/N]: " "$DAEMON_INSTALL_DIR"
+        printf "  Delete /opt/zymi? [y/N]: "
 
         local confirm=""
-        if [ -e /dev/tty ]; then
-            read -r confirm </dev/tty || true
-        else
-            # Non-interactive (e.g. ssh "cmd") — default to no
-            confirm=""
+        if exec 3</dev/tty 2>/dev/null; then
+            read -r confirm <&3 || true
+            exec 3<&-
         fi
 
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            rm -rf "$DAEMON_INSTALL_DIR"
-            green "  Removed $DAEMON_INSTALL_DIR"
+            rm -rf /opt/zymi
+            green "  Removed /opt/zymi"
         else
-            dim "  Kept $DAEMON_INSTALL_DIR"
+            dim "  Kept /opt/zymi"
         fi
     fi
 
@@ -693,37 +290,13 @@ uninstall_daemon() {
     fi
 
     echo ""
-    green "Zymi daemon uninstalled."
-}
-
-uninstall_user() {
-    echo "Uninstalling Zymi..."
-    echo ""
-
-    if [ -f "$INSTALL_DIR/zymi" ]; then
-        rm "$INSTALL_DIR/zymi"
-        green "  Removed $INSTALL_DIR/zymi"
-    else
-        dim "  Binary not found at $INSTALL_DIR/zymi"
-    fi
-
-    echo ""
     green "Zymi uninstalled."
 }
 
 # ─── Main ────────────────────────────────────────────────────────────
 
 if [ "$UNINSTALL_MODE" = true ]; then
-    # Auto-detect: daemon install exists?
-    if [ -f /etc/systemd/system/zymi.service ] || [ -d "$DAEMON_INSTALL_DIR" ] || [ -f /usr/local/bin/zymi ]; then
-        if [ "$(id -u)" -ne 0 ]; then
-            red "Error: uninstalling daemon requires root (use sudo)"
-            exit 1
-        fi
-        uninstall_daemon
-    else
-        uninstall_user
-    fi
+    uninstall
     exit 0
 fi
 
@@ -735,8 +308,4 @@ else
     download_binary
 fi
 
-if [ "$DAEMON_MODE" = true ]; then
-    install_daemon
-else
-    install_user
-fi
+install_binary

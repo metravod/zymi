@@ -31,8 +31,8 @@ impl ManageScheduleTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing required parameter: task")?;
 
-        let cron_expr = args.get("cron").and_then(|v| v.as_str());
-        let once_at_str = args.get("once_at").and_then(|v| v.as_str());
+        let cron_expr = args.get("cron").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty() && *s != ".");
+        let once_at_str = args.get("once_at").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
 
         if cron_expr.is_none() && once_at_str.is_none() {
             return Err("Either 'cron' or 'once_at' must be provided".to_string());

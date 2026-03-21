@@ -8,9 +8,9 @@ const LOG_FILE: &str = "zymi.log"; // relative to memory_dir
 const GITHUB_REPO: &str = "metravod/zymi";
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/zymi.service";
 
-/// Returns true if a systemd service is installed for zymi.
+/// Returns true if a systemd service is installed and we're NOT already running inside it.
 fn has_systemd_service() -> bool {
-    Path::new(SYSTEMD_UNIT).exists()
+    Path::new(SYSTEMD_UNIT).exists() && std::env::var("INVOCATION_ID").is_err()
 }
 
 fn systemctl(args: &[&str]) -> bool {

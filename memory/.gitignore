@@ -1,0 +1,32 @@
+# Database
+conversations.db
+conversations.db-wal
+conversations.db-shm
+
+# Auth tokens
+auth.json
+
+# Runtime
+.heartbeat
+zymi.log
+*.log
+
+# Audit log (contains personal data)
+audit.jsonl
+
+# Workflow traces (runtime artifacts)
+workflow_traces/
+
+# Conversation summaries (personal data)
+conversations/
+
+# Agent memory files (personal data)
+memory/*
+!memory/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Tool embeddings cache
+tool_embeddings.json

@@ -1,0 +1,26 @@
+{
+  "models": [
+    {
+      "id": "gpt-4.1-mini",
+      "name": "gpt-4.1-mini",
+      "provider": "openai_compatible",
+      "api_key_env": "OPENAI_API_KEY",
+      "is_default": true
+    },
+    {
+      "id": "claude-sonnet-4-5-20250514",
+      "name": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "is_default": false
+    }
+  ],
+  "settings": {
+    "max_iterations": 6,
+    "summary_threshold": 50,
+    "heartbeat_interval_secs": 300,
+    "tool_selection": false,
+    "tool_selection_top_k": 8,
+    "auto_extract": true
+  }
+}

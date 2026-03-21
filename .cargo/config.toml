@@ -1,0 +1,11 @@
+# Use mold linker if available (install: brew install mold)
+# Falls back to the default linker if mold is not found.
+#
+# Uncomment after installing mold:
+# [target.aarch64-apple-darwin]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[profile.dev]
+# Split debug info into separate files — speeds up linking
+split-debuginfo = "unpacked"

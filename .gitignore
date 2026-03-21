@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Environment variables
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# PID files
+*.pid
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

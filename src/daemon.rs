@@ -310,7 +310,7 @@ pub fn logs() {
 
 fn detect_target() -> String {
     let os = match std::env::consts::OS {
-        "linux" => "unknown-linux-gnu",
+        "linux" => "unknown-linux-musl",
         "macos" => "apple-darwin",
         "windows" => "pc-windows-msvc",
         other => {

@@ -149,27 +149,53 @@ impl MonitorConfig {
     }
 }
 
-/// Sanitize conversation history by removing trailing assistant messages
-/// with tool_calls that don't have corresponding tool result messages.
-/// This can happen when the process crashes between saving the assistant
-/// message and saving all tool results.
+/// Sanitize conversation history by:
+/// 1. Removing orphaned ToolResults whose tool_call is missing (e.g. after summarization)
+/// 2. Removing trailing Assistant messages with tool_calls that lack corresponding results
+///    (e.g. after a crash between saving assistant message and tool results)
 fn sanitize_history(messages: &mut Vec<Message>) {
+    // Pass 1: remove orphaned ToolResults (tool_call_id not found in any Assistant)
+    let all_call_ids: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| {
+            if let Message::Assistant { tool_calls, .. } = m {
+                Some(tool_calls.iter().map(|tc| tc.id.clone()))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    let before = messages.len();
+    messages.retain(|m| {
+        if let Message::ToolResult { tool_call_id, .. } = m {
+            all_call_ids.contains(tool_call_id)
+        } else {
+            true
+        }
+    });
+    if messages.len() < before {
+        log::warn!(
+            "Sanitizing history: removed {} orphaned tool result(s)",
+            before - messages.len()
+        );
+    }
+
+    // Pass 2: remove trailing Assistant messages with missing tool results
     loop {
-        // Find the last assistant message with tool_calls
         let last_assistant_idx = messages.iter().rposition(|m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()));
 
         let Some(idx) = last_assistant_idx else {
             break;
         };
 
-        // Collect expected tool_call_ids from this assistant message
         let expected_ids: HashSet<String> = if let Message::Assistant { tool_calls, .. } = &messages[idx] {
             tool_calls.iter().map(|tc| tc.id.clone()).collect()
         } else {
             break;
         };
 
-        // Collect actual tool result ids that follow this assistant message
         let actual_ids: HashSet<String> = messages[idx + 1..]
             .iter()
             .filter_map(|m| {
@@ -181,12 +207,10 @@ fn sanitize_history(messages: &mut Vec<Message>) {
             })
             .collect();
 
-        // Check if all expected tool_call_ids have corresponding results
         if expected_ids.is_subset(&actual_ids) {
-            break; // History is consistent
+            break;
         }
 
-        // Remove the broken assistant message and any partial tool results after it
         let missing: Vec<_> = expected_ids.difference(&actual_ids).collect();
         log::warn!(
             "Sanitizing history: removing assistant message at index {} with {} orphaned tool_call(s): {:?}",
@@ -195,7 +219,6 @@ fn sanitize_history(messages: &mut Vec<Message>) {
             missing
         );
         messages.truncate(idx);
-        // Loop again to check if there are more broken entries
     }
 }
 
@@ -1102,8 +1125,16 @@ async fn summarize_conversation(
         return;
     }
 
-    // Split: summarize the older part, keep the recent part
-    let split_point = history.len().saturating_sub(KEEP_RECENT_MESSAGES);
+    // Split: summarize the older part, keep the recent part.
+    // Adjust split point so we never orphan a ToolResult from its tool_call.
+    let mut split_point = history.len().saturating_sub(KEEP_RECENT_MESSAGES);
+    while split_point > 0 {
+        if let Message::ToolResult { .. } = &history[split_point] {
+            split_point -= 1;
+        } else {
+            break;
+        }
+    }
     let to_summarize = &history[..split_point];
     let to_keep: Vec<Message> = history[split_point..].to_vec();
 

@@ -169,16 +169,16 @@ fn convert_messages(messages: &[Message]) -> Vec<ResponsesInput> {
             Message::UserMultimodal { parts } => {
                 let content_parts: Vec<serde_json::Value> = parts
                     .iter()
-                    .filter_map(|p| match p {
-                        super::ContentPart::Text(t) => Some(serde_json::json!({
+                    .map(|p| match p {
+                        super::ContentPart::Text(t) => serde_json::json!({
                             "type": "input_text",
                             "text": t,
-                        })),
+                        }),
                         super::ContentPart::ImageBase64 { media_type, data } => {
-                            Some(serde_json::json!({
+                            serde_json::json!({
                                 "type": "input_image",
                                 "image_url": format!("data:{media_type};base64,{data}"),
-                            }))
+                            })
                         }
                     })
                     .collect();

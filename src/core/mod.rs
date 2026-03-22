@@ -8,6 +8,7 @@ pub mod langfuse;
 pub mod openai;
 pub mod provider_manager;
 pub mod tool_selector;
+pub mod transcription;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -43,9 +44,21 @@ pub struct ToolDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContentPart {
+    Text(String),
+    ImageBase64 {
+        media_type: String,
+        data: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     System(String),
     User(String),
+    UserMultimodal {
+        parts: Vec<ContentPart>,
+    },
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCallInfo>,
@@ -54,6 +67,20 @@ pub enum Message {
         tool_call_id: String,
         content: String,
     },
+}
+
+impl Message {
+    /// Extract the plain text from a user message.
+    pub fn user_text(&self) -> Option<&str> {
+        match self {
+            Message::User(t) => Some(t),
+            Message::UserMultimodal { parts } => parts.iter().find_map(|p| match p {
+                ContentPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

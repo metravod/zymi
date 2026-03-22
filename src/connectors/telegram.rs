@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine;
+use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage, ParseMode, UpdateKind,
@@ -12,7 +14,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::core::agent::Agent;
 use crate::core::approval::{ApprovalHandler, ApprovalSlotGuard, SharedApprovalHandler};
 use crate::core::provider_manager::ProviderManager;
-use crate::core::LlmError;
+use crate::core::transcription::TranscriptionService;
+use crate::core::{ContentPart, LlmError};
 use crate::tools::ask_user::UserQuestion;
 
 const TELEGRAM_MSG_LIMIT: usize = 4096;
@@ -82,6 +85,7 @@ async fn send_long_message(bot: &Bot, chat_id: ChatId, text: &str) -> ResponseRe
 type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 type PendingQuestions = Arc<std::sync::Mutex<HashMap<ChatId, oneshot::Sender<String>>>>;
 type ActiveChat = Arc<std::sync::Mutex<Option<ChatId>>>;
+type SharedTranscription = Arc<Option<TranscriptionService>>;
 
 /// Global pending approvals state, used by `TelegramApprovalHandler`.
 static PENDING_APPROVALS: std::sync::OnceLock<PendingApprovals> = std::sync::OnceLock::new();
@@ -322,6 +326,14 @@ pub async fn run(
     let active_chat: ActiveChat = Arc::new(std::sync::Mutex::new(None));
     let start_time = std::time::Instant::now();
 
+    let transcription: SharedTranscription = Arc::new(
+        std::env::var("OPENAI_API_KEY").ok().map(|key| {
+            let base_url = std::env::var("OPENAI_BASE_URL").ok();
+            log::info!("Transcription service initialized (Whisper)");
+            TranscriptionService::new(&key, base_url.as_deref())
+        }),
+    );
+
     let pending_for_handler = pending.clone();
 
     // Forward ask_user questions to the active Telegram chat
@@ -351,7 +363,8 @@ pub async fn run(
             shared_approval,
             start_time,
             pending_questions.clone(),
-            active_chat
+            active_chat,
+            transcription
         ])
         // Allow callback queries and ask_user replies to run concurrently.
         // Without this, ask_user deadlocks: gpt_handler waits for the user's
@@ -553,41 +566,100 @@ async fn gpt_handler(
     start_time: std::time::Instant,
     pending_questions: PendingQuestions,
     active_chat: ActiveChat,
+    transcription: SharedTranscription,
 ) -> ResponseResult<()> {
-    let text = match msg.text() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
     let chat_id = msg.chat.id;
 
-    // If there's a pending ask_user question for this chat, route the reply
-    {
-        let responder = pending_questions.lock().unwrap().remove(&chat_id);
-        if let Some(responder) = responder {
-            log::info!("ask_user: received reply for chat_id={}, len={}", chat_id, text.len());
-            let _ = responder.send(text.to_string());
-            return Ok(());
-        }
-    }
-
-    let user_id = msg.from.as_ref().map(|u| u.id.0);
-    log::info!(
-        "Telegram message: user_id={:?}, chat_id={}, len={}",
-        user_id,
-        chat_id,
-        text.len()
-    );
-
-    // Handle slash commands
-    if let Some(cmd) = parse_slash_command(text) {
-        return match cmd {
-            SlashCommand::Model(id) => handle_model_command(&bot, chat_id, &provider_manager, id).await,
-            SlashCommand::Clear => handle_clear_command(&bot, chat_id, &agent).await,
-            SlashCommand::Status => handle_status_command(&bot, chat_id, &provider_manager, start_time).await,
-            SlashCommand::Help => handle_help_command(&bot, chat_id).await,
+    // --- Build user message from text, voice, or photo ---
+    let user_message: crate::core::Message = if let Some(voice) = msg.voice() {
+        // Voice message → transcribe to text
+        let svc = match transcription.as_ref() {
+            Some(svc) => svc,
+            None => {
+                bot.send_message(chat_id, "Voice transcription is not configured (OPENAI_API_KEY missing)")
+                    .await?;
+                return Ok(());
+            }
         };
-    }
+
+        let file = bot.get_file(voice.file.id.clone()).await?;
+        let mut buf = Vec::new();
+        bot.download_file(&file.path, &mut buf).await?;
+
+        log::info!("Voice message: chat_id={}, file_size={}", chat_id, buf.len());
+
+        match svc.transcribe(buf, "voice.ogg").await {
+            Ok(text) => {
+                // Show transcription to user
+                let preview = format!("\u{1f3a4} {text}");
+                bot.send_message(chat_id, &preview).await.ok();
+                crate::core::Message::User(text)
+            }
+            Err(e) => {
+                log::error!("Transcription failed: {e}");
+                bot.send_message(chat_id, format!("Transcription failed: {e}"))
+                    .await?;
+                return Ok(());
+            }
+        }
+    } else if let Some(photos) = msg.photo() {
+        // Photo → base64 encode and send as multimodal
+        let photo = match photos.last() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let file = bot.get_file(photo.file.id.clone()).await?;
+        let mut buf = Vec::new();
+        bot.download_file(&file.path, &mut buf).await?;
+
+        log::info!("Photo message: chat_id={}, file_size={}", chat_id, buf.len());
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let mut parts = Vec::new();
+        let caption = msg.caption().unwrap_or("What's in this image?");
+        parts.push(ContentPart::Text(caption.to_string()));
+        parts.push(ContentPart::ImageBase64 {
+            media_type: "image/jpeg".to_string(),
+            data: b64,
+        });
+        crate::core::Message::UserMultimodal { parts }
+    } else if let Some(text) = msg.text() {
+        // Text message — existing logic
+
+        // If there's a pending ask_user question for this chat, route the reply
+        {
+            let responder = pending_questions.lock().unwrap().remove(&chat_id);
+            if let Some(responder) = responder {
+                log::info!("ask_user: received reply for chat_id={}, len={}", chat_id, text.len());
+                let _ = responder.send(text.to_string());
+                return Ok(());
+            }
+        }
+
+        let user_id = msg.from.as_ref().map(|u| u.id.0);
+        log::info!(
+            "Telegram message: user_id={:?}, chat_id={}, len={}",
+            user_id,
+            chat_id,
+            text.len()
+        );
+
+        // Handle slash commands
+        if let Some(cmd) = parse_slash_command(text) {
+            return match cmd {
+                SlashCommand::Model(id) => handle_model_command(&bot, chat_id, &provider_manager, id).await,
+                SlashCommand::Clear => handle_clear_command(&bot, chat_id, &agent).await,
+                SlashCommand::Status => handle_status_command(&bot, chat_id, &provider_manager, start_time).await,
+                SlashCommand::Help => handle_help_command(&bot, chat_id).await,
+            };
+        }
+
+        crate::core::Message::User(text.to_string())
+    } else {
+        // Unsupported message type
+        return Ok(());
+    };
 
     // Typing indicator is cosmetic — don't let it block the handler
     if let Err(e) = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await {
@@ -607,7 +679,7 @@ async fn gpt_handler(
 
     let start = std::time::Instant::now();
     let result = agent
-        .process(&conversation_id, text, Some(approval_handler.as_ref()))
+        .process_multimodal(&conversation_id, user_message, Some(approval_handler.as_ref()))
         .await;
 
     // Clear active chat

@@ -166,6 +166,25 @@ fn convert_messages(messages: &[Message]) -> Vec<ResponsesInput> {
                     content: text.clone(),
                 });
             }
+            Message::UserMultimodal { parts } => {
+                let text: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        super::ContentPart::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = if text.is_empty() {
+                    "[Image received but this model does not support vision]".to_string()
+                } else {
+                    text
+                };
+                input.push(ResponsesInput::Message {
+                    role: "user".to_string(),
+                    content: text,
+                });
+            }
             Message::Assistant {
                 content,
                 tool_calls,

@@ -3,7 +3,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
+use super::{ContentPart, LlmError, LlmProvider, LlmResponse, Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -42,10 +42,20 @@ enum ApiContent {
 }
 
 #[derive(Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    type_: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -149,6 +159,25 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
                 api_messages.push(ApiMessage {
                     role: "user".to_string(),
                     content: ApiContent::Text(text.clone()),
+                });
+            }
+            Message::UserMultimodal { parts } => {
+                let blocks: Vec<ContentBlock> = parts
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::Text(text) => ContentBlock::Text { text: text.clone() },
+                        ContentPart::ImageBase64 { media_type, data } => ContentBlock::Image {
+                            source: ImageSource {
+                                type_: "base64".to_string(),
+                                media_type: media_type.clone(),
+                                data: data.clone(),
+                            },
+                        },
+                    })
+                    .collect();
+                api_messages.push(ApiMessage {
+                    role: "user".to_string(),
+                    content: ApiContent::Blocks(blocks),
                 });
             }
             Message::Assistant {

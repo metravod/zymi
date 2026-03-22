@@ -4,10 +4,12 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
         ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequestArgs,
-        FunctionCall, FunctionObjectArgs,
+        FunctionCall, FunctionObjectArgs, ImageUrl,
     },
     Client,
 };
@@ -15,7 +17,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use super::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
+use super::{ContentPart, LlmError, LlmProvider, LlmResponse, Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
 
 pub struct OpenAiProvider {
     client: Client<OpenAIConfig>,
@@ -57,6 +59,35 @@ fn convert_message(msg: &Message) -> Result<ChatCompletionRequestMessage, LlmErr
             .build()
             .map_err(map_err)?
             .into()),
+        Message::UserMultimodal { parts } => {
+            let content_parts: Vec<ChatCompletionRequestUserMessageContentPart> = parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text(text) => {
+                        ChatCompletionRequestUserMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText {
+                                text: text.clone(),
+                            },
+                        )
+                    }
+                    ContentPart::ImageBase64 { media_type, data } => {
+                        ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                            ChatCompletionRequestMessageContentPartImage {
+                                image_url: ImageUrl {
+                                    url: format!("data:{media_type};base64,{data}"),
+                                    detail: None,
+                                },
+                            },
+                        )
+                    }
+                })
+                .collect();
+            Ok(ChatCompletionRequestUserMessageArgs::default()
+                .content(ChatCompletionRequestUserMessageContent::Array(content_parts))
+                .build()
+                .map_err(map_err)?
+                .into())
+        }
         Message::Assistant {
             content,
             tool_calls,

@@ -588,12 +588,12 @@ impl Agent {
     async fn prepare_messages(
         &self,
         conversation_id: &str,
-        user_message: &str,
+        user_message: Message,
     ) -> Result<(Vec<Message>, usize), LlmError> {
         self.storage
             .add_message(
                 conversation_id,
-                &Message::User(user_message.to_string()),
+                &user_message,
             )
             .await
             .map_err(|e| LlmError::StorageError(e.to_string()))?;
@@ -645,7 +645,9 @@ impl Agent {
         }
 
         // Fire-and-forget fact extraction from user message
-        self.spawn_extract(user_message);
+        if let Some(text) = user_message.user_text() {
+            self.spawn_extract(text);
+        }
 
         if let Some(summary) = self.load_summary(conversation_id) {
             messages.push(Message::System(format!(
@@ -809,22 +811,23 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn process(
+    pub async fn process_multimodal(
         &self,
         conversation_id: &str,
-        user_message: &str,
+        user_message: Message,
         approval_handler: Option<&dyn ApprovalHandler>,
     ) -> Result<String, LlmError> {
+        let user_text = user_message.user_text().unwrap_or("").to_string();
         log::info!(
             "Agent process: conversation_id={}, message_len={}",
             conversation_id,
-            user_message.len()
+            user_text.len()
         );
 
-        let trace = self.trace_ctx(conversation_id, user_message);
+        let trace = self.trace_ctx(conversation_id, &user_text);
 
         let (mut messages, _history_len) = self.prepare_messages(conversation_id, user_message).await?;
-        let tool_definitions = self.get_tool_definitions(user_message).await;
+        let tool_definitions = self.get_tool_definitions(&user_text).await;
         let mut monitor_reviews: usize = 0;
         let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
 
@@ -924,6 +927,20 @@ impl Agent {
         Ok(content)
     }
 
+    pub async fn process(
+        &self,
+        conversation_id: &str,
+        user_message: &str,
+        approval_handler: Option<&dyn ApprovalHandler>,
+    ) -> Result<String, LlmError> {
+        self.process_multimodal(
+            conversation_id,
+            Message::User(user_message.to_string()),
+            approval_handler,
+        )
+        .await
+    }
+
     pub async fn process_stream(
         &self,
         conversation_id: &str,
@@ -963,7 +980,7 @@ impl Agent {
             }
         }
 
-        let (mut messages, history_len) = self.prepare_messages(conversation_id, user_message).await?;
+        let (mut messages, history_len) = self.prepare_messages(conversation_id, Message::User(user_message.to_string())).await?;
         let tool_definitions = self.get_tool_definitions(user_message).await;
         let mut monitor_reviews: usize = 0;
         let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
@@ -1326,6 +1343,22 @@ fn format_history_for_summary(messages: &[Message]) -> String {
             Message::System(_) => {}
             Message::User(content) => {
                 parts.push(format!("User: {}", truncate_for_summary(content, 500)));
+            }
+            Message::UserMultimodal { parts: msg_parts } => {
+                let text: String = msg_parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        crate::core::ContentPart::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = if msg_parts.iter().any(|p| matches!(p, crate::core::ContentPart::ImageBase64 { .. })) {
+                    "User [with image]"
+                } else {
+                    "User"
+                };
+                parts.push(format!("{label}: {}", truncate_for_summary(&text, 500)));
             }
             Message::Assistant {
                 content,

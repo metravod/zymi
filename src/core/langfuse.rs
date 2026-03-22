@@ -344,6 +344,18 @@ fn messages_for_trace(messages: &[Message]) -> Value {
                 "role": "user",
                 "content": truncate(s, 500),
             }),
+            Message::UserMultimodal { parts } => {
+                let text = parts.iter().filter_map(|p| match p {
+                    super::ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join(" ");
+                let has_image = parts.iter().any(|p| matches!(p, super::ContentPart::ImageBase64 { .. }));
+                json!({
+                    "role": "user",
+                    "content": truncate(&text, 500),
+                    "has_image": has_image,
+                })
+            }
             Message::Assistant {
                 content,
                 tool_calls,

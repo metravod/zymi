@@ -38,7 +38,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install musl-tools
         if: contains(matrix.target, 'musl') && !matrix.use_cross
@@ -77,7 +77,7 @@ jobs:
           7z a "$STAGING.zip" "$STAGING"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: zymi-${{ matrix.target }}
           path: zymi-*.${{ matrix.archive }}
@@ -86,7 +86,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
 

@@ -42,16 +42,25 @@ pub fn sync_to_service(memory_dir: &Path, files: &[&str]) {
         }
         let dst = format!("{}/{}", SYSTEMD_MEMORY_DIR, file);
         let src_str = src.to_string_lossy();
-        if Command::new("sudo")
+        match Command::new("sudo")
             .args(["cp", &src_str, &dst])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
         {
-            let _ = Command::new("sudo")
-                .args(["chown", "zymi:zymi", &dst])
-                .status();
-            println!("  Synced {file} → {dst}");
+            Ok(s) if s.success() => {
+                let _ = Command::new("sudo")
+                    .args(["chown", "zymi:zymi", &dst])
+                    .status();
+                println!("  Synced {file} → {dst}");
+            }
+            Ok(s) => {
+                eprintln!(
+                    "  Warning: failed to sync {file} (exit code {})",
+                    s.code().unwrap_or(-1)
+                );
+            }
+            Err(e) => {
+                eprintln!("  Warning: failed to sync {file}: {e}");
+            }
         }
     }
 }
@@ -142,25 +151,44 @@ pub fn start() {
 
     // No systemd — direct daemon mode
     if is_running() {
-        let pid = read_pid().unwrap();
-        println!("Zymi is already running (PID {pid}).");
+        if let Some(pid) = read_pid() {
+            println!("Zymi is already running (PID {pid}).");
+        } else {
+            println!("Zymi is already running.");
+        }
         return;
     }
 
-    let exe = std::env::current_exe().expect("Failed to get executable path");
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Failed to get executable path: {e}");
+            process::exit(1);
+        }
+    };
 
     let log = log_path();
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .expect("Failed to open log file");
+    let log_file = match fs::OpenOptions::new().create(true).append(true).open(&log) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to open log file {}: {e}", log.display());
+            process::exit(1);
+        }
+    };
+
+    let log_stderr = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to clone file handle: {e}");
+            process::exit(1);
+        }
+    };
 
     let mut cmd = Command::new(&exe);
     cmd.arg("run")
         .stdin(Stdio::null())
-        .stdout(log_file.try_clone().expect("Failed to clone file handle"))
-        .stderr(log_file);
+        .stdout(log_file)
+        .stderr(log_stderr);
 
     if std::env::var("RUST_LOG").is_err() {
         cmd.env("RUST_LOG", "info");
@@ -173,10 +201,19 @@ pub fn start() {
     }
 
     #[allow(clippy::zombie_processes)] // Intentional: daemon detaches from parent
-    let child = cmd.spawn().expect("Failed to start Zymi daemon");
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to start Zymi daemon: {e}");
+            process::exit(1);
+        }
+    };
     let pid = child.id();
 
-    fs::write(PID_FILE, pid.to_string()).expect("Failed to write PID file");
+    if let Err(e) = fs::write(PID_FILE, pid.to_string()) {
+        eprintln!("Failed to write PID file: {e}");
+        process::exit(1);
+    }
 
     // Wait for the process to either die or become ready (up to 5s)
     let log_display = log.display().to_string();
@@ -210,7 +247,7 @@ pub fn stop() {
         if systemctl(&["stop", "zymi.service"]) {
             println!("Zymi stopped.");
         } else {
-            eprintln!("Failed to stop zymi service.");
+            eprintln!("Failed to stop zymi service. Check: sudo systemctl status zymi");
             process::exit(1);
         }
         return;
@@ -250,6 +287,10 @@ pub fn stop() {
     if is_pid_alive(pid) {
         eprintln!("Force killing...");
         kill_pid(pid, "-KILL");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if is_pid_alive(pid) {
+            eprintln!("WARNING: Failed to kill process {pid}. It may still be running.");
+        }
     }
 
     let _ = fs::remove_file(PID_FILE);
@@ -329,6 +370,17 @@ fn detect_target() -> String {
     };
 
     format!("{arch}-{os}")
+}
+
+/// RAII guard that removes a temp directory on drop.
+struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 pub async fn update() {
@@ -434,10 +486,19 @@ pub async fn update() {
 
     let tmp_dir = std::env::temp_dir().join("zymi-update");
     let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir).expect("Failed to create temp directory");
+    if let Err(e) = fs::create_dir_all(&tmp_dir) {
+        eprintln!("Failed to create temp directory: {e}");
+        process::exit(1);
+    }
+    let _tmp_guard = TempDirGuard {
+        path: tmp_dir.clone(),
+    };
 
     let archive_path = tmp_dir.join(&archive_name);
-    fs::write(&archive_path, &bytes).expect("Failed to write downloaded file");
+    if let Err(e) = fs::write(&archive_path, &bytes) {
+        eprintln!("Failed to write downloaded file: {e}");
+        process::exit(1);
+    }
 
     // Verify checksum if checksums file is available
     let checksums_url = format!(
@@ -463,7 +524,6 @@ pub async fn update() {
                             "Checksum mismatch!\n  Expected: {}\n  Got:      {}",
                             expected_hash, hash
                         );
-                        let _ = fs::remove_dir_all(&tmp_dir);
                         process::exit(1);
                     }
                     None => {
@@ -480,7 +540,7 @@ pub async fn update() {
     // Extract
     #[cfg(unix)]
     {
-        let status = Command::new("tar")
+        let status = match Command::new("tar")
             .args([
                 "xzf",
                 &archive_path.to_string_lossy(),
@@ -488,17 +548,22 @@ pub async fn update() {
                 &tmp_dir.to_string_lossy(),
             ])
             .status()
-            .expect("Failed to run tar");
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to run tar: {e}");
+                process::exit(1);
+            }
+        };
         if !status.success() {
             eprintln!("Failed to extract archive.");
-            let _ = fs::remove_dir_all(&tmp_dir);
             process::exit(1);
         }
     }
 
     #[cfg(windows)]
     {
-        let status = Command::new("powershell")
+        let status = match Command::new("powershell")
             .args([
                 "-Command",
                 &format!(
@@ -508,10 +573,15 @@ pub async fn update() {
                 ),
             ])
             .status()
-            .expect("Failed to extract archive");
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to extract archive: {e}");
+                process::exit(1);
+            }
+        };
         if !status.success() {
             eprintln!("Failed to extract archive.");
-            let _ = fs::remove_dir_all(&tmp_dir);
             process::exit(1);
         }
     }
@@ -523,25 +593,71 @@ pub async fn update() {
 
     if !new_bin.exists() {
         eprintln!("Binary not found in archive.");
-        let _ = fs::remove_dir_all(&tmp_dir);
         process::exit(1);
     }
 
-    // Replace binary atomically
-    let current_exe = std::env::current_exe().expect("Failed to get executable path");
+    // Replace binary — try direct write, fall back to sudo on permission denied
+    let current_exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Failed to get executable path: {e}");
+            process::exit(1);
+        }
+    };
+
     let temp_exe = current_exe.with_extension("update-tmp");
-
-    fs::copy(&new_bin, &temp_exe).expect("Failed to copy new binary");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_exe, fs::Permissions::from_mode(0o755))
-            .expect("Failed to set permissions");
+    match fs::copy(&new_bin, &temp_exe) {
+        Ok(_) => {
+            // Direct write succeeded
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    fs::set_permissions(&temp_exe, fs::Permissions::from_mode(0o755))
+                {
+                    eprintln!("Failed to set permissions: {e}");
+                    let _ = fs::remove_file(&temp_exe);
+                    process::exit(1);
+                }
+            }
+            if let Err(e) = fs::rename(&temp_exe, &current_exe) {
+                eprintln!("Failed to replace binary: {e}");
+                let _ = fs::remove_file(&temp_exe);
+                process::exit(1);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Fall back to sudo
+            println!(
+                "Root permissions required to update {}.",
+                current_exe.display()
+            );
+            let status = match Command::new("sudo")
+                .args(["cp", "-f"])
+                .arg(&new_bin)
+                .arg(&current_exe)
+                .status()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to run sudo: {e}");
+                    process::exit(1);
+                }
+            };
+            if !status.success() {
+                eprintln!("Failed to copy binary with sudo.");
+                process::exit(1);
+            }
+            let _ = Command::new("sudo")
+                .args(["chmod", "755"])
+                .arg(&current_exe)
+                .status();
+        }
+        Err(e) => {
+            eprintln!("Failed to copy binary: {e}");
+            process::exit(1);
+        }
     }
-
-    fs::rename(&temp_exe, &current_exe).expect("Failed to replace binary");
-    let _ = fs::remove_dir_all(&tmp_dir);
 
     println!("Updated to {latest_tag}.");
 

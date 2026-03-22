@@ -90,7 +90,7 @@ struct ResponsesRequest {
 enum ResponsesInput {
     Message {
         role: String,
-        content: String,
+        content: serde_json::Value,
     },
     FunctionCall {
         #[serde(rename = "type")]
@@ -163,26 +163,28 @@ fn convert_messages(messages: &[Message]) -> Vec<ResponsesInput> {
             Message::User(text) => {
                 input.push(ResponsesInput::Message {
                     role: "user".to_string(),
-                    content: text.clone(),
+                    content: serde_json::Value::String(text.clone()),
                 });
             }
             Message::UserMultimodal { parts } => {
-                let text: String = parts
+                let content_parts: Vec<serde_json::Value> = parts
                     .iter()
                     .filter_map(|p| match p {
-                        super::ContentPart::Text(t) => Some(t.as_str()),
-                        _ => None,
+                        super::ContentPart::Text(t) => Some(serde_json::json!({
+                            "type": "input_text",
+                            "text": t,
+                        })),
+                        super::ContentPart::ImageBase64 { media_type, data } => {
+                            Some(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{media_type};base64,{data}"),
+                            }))
+                        }
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let text = if text.is_empty() {
-                    "[Image received but this model does not support vision]".to_string()
-                } else {
-                    text
-                };
+                    .collect();
                 input.push(ResponsesInput::Message {
                     role: "user".to_string(),
-                    content: text,
+                    content: serde_json::Value::Array(content_parts),
                 });
             }
             Message::Assistant {
@@ -192,7 +194,7 @@ fn convert_messages(messages: &[Message]) -> Vec<ResponsesInput> {
                 if let Some(text) = content {
                     input.push(ResponsesInput::Message {
                         role: "assistant".to_string(),
-                        content: text.clone(),
+                        content: serde_json::Value::String(text.clone()),
                     });
                 }
                 for tc in tool_calls {

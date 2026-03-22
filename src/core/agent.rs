@@ -304,8 +304,8 @@ impl Agent {
         self
     }
 
-    pub fn with_tool_selector(self, selector: ToolSelector) -> Self {
-        *self.tool_selector.blocking_write() = Some(selector);
+    pub fn with_tool_selector(mut self, selector: ToolSelector) -> Self {
+        self.tool_selector = RwLock::new(Some(selector));
         self
     }
 

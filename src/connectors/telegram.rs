@@ -570,6 +570,29 @@ async fn gpt_handler(
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
 
+    // --- Cancel any pending ask_user question for this chat ---
+    // This must happen BEFORE message-type branching so that photos and voice
+    // messages also cancel a pending question (previously only text did).
+    // For text messages the reply is forwarded to the waiting ask_user tool;
+    // for other types we just cancel so the old agent call doesn't hang forever.
+    {
+        let is_text = msg.text().is_some();
+        let responder = pending_questions.lock().unwrap().remove(&chat_id);
+        if let Some(responder) = responder {
+            if is_text {
+                // Text reply: forward to the waiting ask_user and return early
+                let text = msg.text().unwrap();
+                log::info!("ask_user: received text reply for chat_id={}, len={}", chat_id, text.len());
+                let _ = responder.send(text.to_string());
+                return Ok(());
+            }
+            // Non-text (photo/voice): cancel the pending question so the old
+            // agent call unblocks with an error instead of hanging forever.
+            log::info!("ask_user: cancelling pending question for chat_id={} (non-text message received)", chat_id);
+            let _ = responder.send("[User sent a new message, question superseded]".to_string());
+        }
+    }
+
     // --- Build user message from text, voice, or photo ---
     let user_message: crate::core::Message = if let Some(voice) = msg.voice() {
         // Voice message → transcribe to text
@@ -625,18 +648,6 @@ async fn gpt_handler(
         });
         crate::core::Message::UserMultimodal { parts }
     } else if let Some(text) = msg.text() {
-        // Text message — existing logic
-
-        // If there's a pending ask_user question for this chat, route the reply
-        {
-            let responder = pending_questions.lock().unwrap().remove(&chat_id);
-            if let Some(responder) = responder {
-                log::info!("ask_user: received reply for chat_id={}, len={}", chat_id, text.len());
-                let _ = responder.send(text.to_string());
-                return Ok(());
-            }
-        }
-
         let user_id = msg.from.as_ref().map(|u| u.id.0);
         log::info!(
             "Telegram message: user_id={:?}, chat_id={}, len={}",

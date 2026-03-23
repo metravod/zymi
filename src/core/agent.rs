@@ -182,7 +182,11 @@ fn sanitize_history(messages: &mut Vec<Message>) {
         );
     }
 
-    // Pass 2: remove trailing Assistant messages with missing tool results
+    // Pass 2: remove Assistant messages with missing tool results.
+    // Only remove the broken assistant and its orphaned ToolResults — keep any
+    // subsequent User/UserMultimodal messages intact.  The old `truncate(idx)`
+    // wiped everything after the broken assistant, which destroyed new user
+    // messages (e.g. a photo) that arrived while ask_user was pending.
     loop {
         let last_assistant_idx = messages.iter().rposition(|m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()));
 
@@ -218,7 +222,21 @@ fn sanitize_history(messages: &mut Vec<Message>) {
             missing.len(),
             missing
         );
-        messages.truncate(idx);
+
+        // Collect IDs of the broken assistant's tool calls for ToolResult cleanup
+        let broken_ids: HashSet<String> = expected_ids;
+
+        // Remove the assistant message itself
+        messages.remove(idx);
+
+        // Remove any ToolResults that belonged to this broken assistant
+        messages.retain(|m| {
+            if let Message::ToolResult { tool_call_id, .. } = m {
+                !broken_ids.contains(tool_call_id)
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -590,14 +608,10 @@ impl Agent {
         conversation_id: &str,
         user_message: Message,
     ) -> Result<(Vec<Message>, usize), LlmError> {
-        self.storage
-            .add_message(
-                conversation_id,
-                &user_message,
-            )
-            .await
-            .map_err(|e| LlmError::StorageError(e.to_string()))?;
-
+        // Load existing history FIRST, sanitize it, and only THEN append the
+        // new user message.  The old order (store → load → sanitize) caused
+        // sanitize_history's truncate to wipe the just-stored message when a
+        // previous assistant had orphaned tool calls (e.g. a pending ask_user).
         let mut history = self
             .storage
             .get_history(conversation_id)
@@ -623,6 +637,14 @@ impl Agent {
                     .map_err(|e| LlmError::StorageError(e.to_string()))?;
             }
         }
+
+        // Now store the new user message (after sanitization, so it can't be
+        // accidentally truncated).
+        self.storage
+            .add_message(conversation_id, &user_message)
+            .await
+            .map_err(|e| LlmError::StorageError(e.to_string()))?;
+        history.push(user_message.clone());
 
         let mut messages = Vec::new();
 

@@ -421,8 +421,17 @@ mod tests {
         assert!(result.contains("task_id:"));
         assert!(result.contains("background"));
 
-        // Wait for the background task to complete
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for the background task to complete (poll instead of fixed sleep)
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let reg = registry.read().await;
+            let tasks = reg.list();
+            if !tasks.is_empty()
+                && tasks[0].status == crate::task_registry::TaskStatus::Completed
+            {
+                break;
+            }
+        }
 
         let reg = registry.read().await;
         let tasks = reg.list();

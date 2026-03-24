@@ -95,22 +95,41 @@ static PENDING_APPROVALS: std::sync::OnceLock<PendingApprovals> = std::sync::Onc
 static PENDING_QUESTIONS: std::sync::OnceLock<PendingQuestions> = std::sync::OnceLock::new();
 
 /// Distribution function for the teloxide dispatcher.
-/// Callbacks and ask_user replies bypass per-chat serialization to avoid deadlocks.
+/// Callbacks and text replies to ask_user bypass per-chat serialization to avoid
+/// deadlocks. Non-text messages (photos, voice) cancel the pending question and
+/// queue behind the current handler so we don't get two concurrent agent processes
+/// corrupting the same conversation history.
 fn distribute_update(update: &Update) -> Option<ChatId> {
-    match update.kind {
+    match &update.kind {
         UpdateKind::CallbackQuery(_) => None,
-        _ => {
-            if let Some(chat) = update.chat() {
-                if let Some(pq) = PENDING_QUESTIONS.get() {
-                    if let Ok(q) = pq.lock() {
-                        if q.contains_key(&chat.id) {
+        UpdateKind::Message(msg) => {
+            let chat_id = msg.chat.id;
+            if let Some(pq) = PENDING_QUESTIONS.get() {
+                if let Ok(mut q) = pq.lock() {
+                    if q.contains_key(&chat_id) {
+                        if msg.text().is_some() {
+                            // Text reply → bypass serialization so it reaches
+                            // the pending ask_user immediately.
                             return None;
                         }
+                        // Non-text (photo/voice/etc.) → cancel the pending
+                        // question to unblock the first handler, but DON'T
+                        // bypass serialization: this message will queue and
+                        // run only after the first handler finishes.
+                        if let Some(responder) = q.remove(&chat_id) {
+                            let _ = responder.send(
+                                "[User sent a photo/media. Do NOT re-ask for it — \
+                                 the message will be processed next.]"
+                                    .to_string(),
+                            );
+                        }
+                        return Some(chat_id);
                     }
                 }
             }
-            update.chat().map(|c| c.id)
+            Some(chat_id)
         }
+        _ => update.chat().map(|c| c.id),
     }
 }
 

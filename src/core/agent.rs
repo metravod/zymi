@@ -931,12 +931,12 @@ impl Agent {
                 self.post_tool_hook(&tool_call.name, &tool_call.arguments, &result).await;
 
                 // Detect ask_user superseded by an incoming photo/media.
-                // The connector sends [PHOTO_RECEIVED] when a non-text message
+                // The connector sends [MEDIA_RECEIVED] when a non-text message
                 // cancels the pending question, or the oneshot is dropped
                 // ("User input cancelled").  In either case, stop iterating —
                 // the photo will be handled by the next queued handler.
                 if tool_call.name == "ask_user"
-                    && (result.contains("[PHOTO_RECEIVED]")
+                    && (result.contains("[MEDIA_RECEIVED]")
                         || result.contains("User input cancelled"))
                 {
                     log::info!("ask_user superseded by incoming photo; aborting agent loop");
@@ -1142,7 +1142,7 @@ impl Agent {
 
                 // Detect ask_user superseded by an incoming photo/media.
                 if tool_call.name == "ask_user"
-                    && (result.contains("[PHOTO_RECEIVED]")
+                    && (result.contains("[MEDIA_RECEIVED]")
                         || result.contains("User input cancelled"))
                 {
                     log::info!("ask_user superseded by incoming photo; aborting agent loop (stream)");

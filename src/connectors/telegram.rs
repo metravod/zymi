@@ -118,7 +118,7 @@ fn distribute_update(update: &Update) -> Option<ChatId> {
                         // run only after the first handler finishes.
                         if let Some(responder) = q.remove(&chat_id) {
                             let _ = responder.send(
-                                "[PHOTO_RECEIVED] User sent a photo/media in response. \
+                                "[MEDIA_RECEIVED] User sent a photo/media in response. \
                                  Stop now — it will be processed as the next message."
                                     .to_string(),
                             );
@@ -609,7 +609,7 @@ async fn gpt_handler(
             // agent call unblocks instead of hanging forever.
             log::info!("ask_user: cancelling pending question for chat_id={} (non-text message received)", chat_id);
             let _ = responder.send(
-                "[PHOTO_RECEIVED] User sent a photo/media in response. \
+                "[MEDIA_RECEIVED] User sent a photo/media in response. \
                  Stop now — it will be processed as the next message."
                     .to_string(),
             );

@@ -118,8 +118,8 @@ fn distribute_update(update: &Update) -> Option<ChatId> {
                         // run only after the first handler finishes.
                         if let Some(responder) = q.remove(&chat_id) {
                             let _ = responder.send(
-                                "[User sent a photo/media. Do NOT re-ask for it — \
-                                 the message will be processed next.]"
+                                "[PHOTO_RECEIVED] User sent a photo/media in response. \
+                                 Stop now — it will be processed as the next message."
                                     .to_string(),
                             );
                         }
@@ -606,9 +606,13 @@ async fn gpt_handler(
                 return Ok(());
             }
             // Non-text (photo/voice): cancel the pending question so the old
-            // agent call unblocks with an error instead of hanging forever.
+            // agent call unblocks instead of hanging forever.
             log::info!("ask_user: cancelling pending question for chat_id={} (non-text message received)", chat_id);
-            let _ = responder.send("[User sent a new message, question superseded]".to_string());
+            let _ = responder.send(
+                "[PHOTO_RECEIVED] User sent a photo/media in response. \
+                 Stop now — it will be processed as the next message."
+                    .to_string(),
+            );
         }
     }
 
@@ -721,7 +725,7 @@ async fn gpt_handler(
     }
 
     match result {
-        Ok(answer) => {
+        Ok(answer) if !answer.is_empty() => {
             log::info!(
                 "Telegram reply: chat_id={}, {:?}, response_len={}",
                 chat_id,
@@ -729,6 +733,10 @@ async fn gpt_handler(
                 answer.len()
             );
             send_long_message(&bot, chat_id, &answer).await?;
+        }
+        Ok(_) => {
+            // Empty response (e.g. ask_user superseded by photo) — nothing to send
+            log::info!("Telegram: chat_id={}, {:?}, suppressed empty response", chat_id, start.elapsed());
         }
         Err(e) => {
             log::error!("LLM error after {:?}: {e}", start.elapsed());

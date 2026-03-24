@@ -14,8 +14,10 @@
 
 Zymi is a chat-driven AI agent that can plan, execute, and iterate on complex tasks autonomously.
 
+- **Structured decision-making** — agent generates multiple approaches, runs sub-agent feasibility simulations in parallel, and selects the best path forward
 - **Workflow engine** — complexity assessment routes simple questions straight to the LLM; multi-step tasks get a DAG with parallel execution, retries, and plan approval
-- **20 built-in tools + any via MCP** — shell, memory, web search, sub-agents, scheduler, code execution. Connect more tools through [Model Context Protocol](https://modelcontextprotocol.io/)
+- **Agent eval loop** — create sub-agents, auto-generate evaluation suites, run them with multi-dimensional LLM judge scoring, iterate on the prompt until evals pass
+- **20+ built-in tools + any via MCP** — shell, memory, web search, sub-agents, scheduler, code execution. Connect more tools through [Model Context Protocol](https://modelcontextprotocol.io/)
 - **Policy engine + audit log** — every shell command passes through allow/deny/approval rules. Every action is logged
 - **Two interfaces** — interactive TUI for local use, Telegram bot for remote access
 - **Multi-provider** — OpenAI, Anthropic, ChatGPT OAuth (use your Plus/Pro subscription)
@@ -82,6 +84,21 @@ zymi                # background
 
 The daemon requires `TELOXIDE_TOKEN` and `ALLOWED_USERS` for Telegram. For local use, `zymi cli` is all you need.
 
+### ChatGPT Plus/Pro login
+
+Use your existing ChatGPT subscription as an LLM provider — no separate API key needed.
+
+```bash
+# Local machine (opens browser automatically)
+zymi login
+
+# Headless server (VPS, cloud instance — no browser available)
+zymi login --remote
+# → Prints an auth URL — open it on any device, log in, copy the redirect URL back
+```
+
+After login, the ChatGPT OAuth provider appears in `models.json` and can be selected via `/model` in Telegram or `Ctrl+M` in CLI.
+
 ## Commands
 
 | Command | Description |
@@ -92,7 +109,9 @@ The daemon requires `TELOXIDE_TOKEN` and `ALLOWED_USERS` for Telegram. For local
 | `zymi setup` | Run setup wizard |
 | `zymi eval [agent]` | Run evaluation suite (`--id`, `--runs`) |
 | `zymi update` | Update to latest release |
-| `zymi login` / `logout` | ChatGPT Plus/Pro OAuth |
+| `zymi login` | ChatGPT Plus/Pro OAuth (opens browser) |
+| `zymi login --remote` | Headless OAuth (paste redirect URL manually) |
+| `zymi logout` | Clear stored OAuth tokens |
 
 ## Tools
 

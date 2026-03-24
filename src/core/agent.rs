@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -48,38 +49,20 @@ const DEFAULT_MAX_ITERATIONS: usize = 25;
 const DEFAULT_MAX_REVIEWS: usize = 1;
 const DEFAULT_SUMMARY_THRESHOLD: usize = 80;
 const MAX_TOOL_OUTPUT: usize = 50_000;
-const KEEP_RECENT_MESSAGES: usize = 20;
+const LLM_TIMEOUT_SECS: u64 = 300;
 
-const SUMMARY_PROMPT: &str = "\
-Summarize the following conversation between a user and an AI assistant. \
-Extract and preserve:\n\
-- Key decisions and agreements\n\
-- Important facts, names, URLs, and technical details\n\
-- Current task status and pending items\n\n\
-Be concise but complete. This summary replaces the conversation history \
-and will be the only context available for future interactions.\n\
-Do NOT include user preferences or personality observations here — \
-those are extracted separately.";
+/// Spawn a background task with panic logging.
+fn spawn_background(label: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        let inner = tokio::spawn(fut);
+        if let Err(e) = inner.await {
+            log::error!("[{label}] background task panicked: {e}");
+        }
+    });
+}
 
-const PREFERENCES_PROMPT: &str = "\
-You are analyzing a conversation to extract lasting insights about the user. \
-Focus ONLY on things that will remain relevant across future conversations.\n\n\
-Extract:\n\
-- Communication style and language preferences (language, formality, brevity)\n\
-- Domain expertise and professional context\n\
-- Recurring interests, hobbies, personal facts\n\
-- Workflow preferences (tools, formats, approaches they prefer)\n\
-- Pet peeves, things they dislike or explicitly asked to avoid\n\
-- Important names, places, projects they reference regularly\n\n\
-Rules:\n\
-- Be concise: one line per insight, use bullet points\n\
-- Skip anything task-specific or temporary\n\
-- Skip obvious things (e.g. \"user asks questions\" — of course they do)\n\
-- If the conversation reveals nothing new about the user, respond with exactly: NO_UPDATE\n\
-- If previous preferences are provided, merge new insights into them: \
-update existing items if new info refines them, add new items, \
-remove items that are clearly contradicted. Return the full updated list.\n\
-- Write in the same language the user primarily speaks in the conversation.";
+use crate::core::extraction::{self, is_trivial_reply};
+use crate::core::history::{self, sanitize_history};
 
 const MONITOR_SYSTEM_PROMPT: &str = "\
 You are a response quality monitor. Your job is to evaluate the assistant's proposed response \
@@ -96,45 +79,6 @@ If the response is acceptable, reply with exactly: APPROVED
 If the response needs improvement, provide specific, actionable feedback on what should be changed. \
 Do NOT rewrite the response yourself — just describe what needs fixing.";
 
-const EXTRACT_FACTS_PROMPT: &str = "\
-You are analyzing a single user message in the context of an ongoing conversation. \
-Extract any durable, interesting facts that would be worth remembering across future conversations.\n\n\
-Focus on:\n\
-- Personal facts: names, relationships, locations, birthdays, pets\n\
-- Professional facts: projects, employers, clients, deadlines, tech stack\n\
-- Preferences and opinions beyond communication style (favorite restaurants, hobbies, brands)\n\
-- Important decisions, plans, goals, or commitments the user mentions\n\
-- Domain knowledge: specific terms, systems, processes the user refers to\n\
-- Any concrete data points (server IPs, project names, repo URLs, account names)\n\n\
-Rules:\n\
-- Return one fact per line, as a bullet point (- fact)\n\
-- Each fact should be self-contained and understandable without conversation context\n\
-- Skip anything that is task-specific instructions to you (e.g. \"fix this bug\" is not a fact)\n\
-- Skip things already present in the existing facts list provided below\n\
-- If no new durable facts are found, respond with exactly: NO_FACTS\n\
-- Write facts in the same language as the user's message.";
-
-const CONSOLIDATE_FACTS_PROMPT: &str = "\
-You are consolidating a list of facts about a user. \
-Merge duplicates, remove contradicted facts (keep the newer version), \
-and organize into logical groups (personal, professional, technical, etc.).\n\n\
-Rules:\n\
-- One fact per line, bullet point format\n\
-- Remove date headers, just keep the clean facts\n\
-- Preserve all unique, non-contradicted information\n\
-- Write in the same language as the original facts.";
-
-fn is_trivial_reply(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    const TRIVIAL: &[&str] = &[
-        "да", "нет", "ок", "ok", "yes", "no", "ага", "угу",
-        "спасибо", "thanks", "thank you", "good", "хорошо", "понял",
-        "ладно", "давай", "go", "got it", "👍", "👎", "+", "-",
-        "продолжай", "continue", "далее", "next", "дальше",
-    ];
-    TRIVIAL.iter().any(|t| lower == *t)
-}
-
 pub struct MonitorConfig {
     pub provider: Arc<dyn LlmProvider>,
     pub max_reviews: usize,
@@ -146,97 +90,6 @@ impl MonitorConfig {
             provider,
             max_reviews: DEFAULT_MAX_REVIEWS,
         }
-    }
-}
-
-/// Sanitize conversation history by:
-/// 1. Removing orphaned ToolResults whose tool_call is missing (e.g. after summarization)
-/// 2. Removing trailing Assistant messages with tool_calls that lack corresponding results
-///    (e.g. after a crash between saving assistant message and tool results)
-fn sanitize_history(messages: &mut Vec<Message>) {
-    // Pass 1: remove orphaned ToolResults (tool_call_id not found in any Assistant)
-    let all_call_ids: HashSet<String> = messages
-        .iter()
-        .filter_map(|m| {
-            if let Message::Assistant { tool_calls, .. } = m {
-                Some(tool_calls.iter().map(|tc| tc.id.clone()))
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect();
-
-    let before = messages.len();
-    messages.retain(|m| {
-        if let Message::ToolResult { tool_call_id, .. } = m {
-            all_call_ids.contains(tool_call_id)
-        } else {
-            true
-        }
-    });
-    if messages.len() < before {
-        log::warn!(
-            "Sanitizing history: removed {} orphaned tool result(s)",
-            before - messages.len()
-        );
-    }
-
-    // Pass 2: remove Assistant messages with missing tool results.
-    // Only remove the broken assistant and its orphaned ToolResults — keep any
-    // subsequent User/UserMultimodal messages intact.  The old `truncate(idx)`
-    // wiped everything after the broken assistant, which destroyed new user
-    // messages (e.g. a photo) that arrived while ask_user was pending.
-    loop {
-        let last_assistant_idx = messages.iter().rposition(|m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()));
-
-        let Some(idx) = last_assistant_idx else {
-            break;
-        };
-
-        let expected_ids: HashSet<String> = if let Message::Assistant { tool_calls, .. } = &messages[idx] {
-            tool_calls.iter().map(|tc| tc.id.clone()).collect()
-        } else {
-            break;
-        };
-
-        let actual_ids: HashSet<String> = messages[idx + 1..]
-            .iter()
-            .filter_map(|m| {
-                if let Message::ToolResult { tool_call_id, .. } = m {
-                    Some(tool_call_id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if expected_ids.is_subset(&actual_ids) {
-            break;
-        }
-
-        let missing: Vec<_> = expected_ids.difference(&actual_ids).collect();
-        log::warn!(
-            "Sanitizing history: removing assistant message at index {} with {} orphaned tool_call(s): {:?}",
-            idx,
-            missing.len(),
-            missing
-        );
-
-        // Collect IDs of the broken assistant's tool calls for ToolResult cleanup
-        let broken_ids: HashSet<String> = expected_ids;
-
-        // Remove the assistant message itself
-        messages.remove(idx);
-
-        // Remove any ToolResults that belonged to this broken assistant
-        messages.retain(|m| {
-            if let Message::ToolResult { tool_call_id, .. } = m {
-                !broken_ids.contains(tool_call_id)
-            } else {
-                true
-            }
-        });
     }
 }
 
@@ -254,7 +107,7 @@ pub struct Agent {
     audit: Option<AuditLog>,
     tool_selector: RwLock<Option<ToolSelector>>,
     auto_extract: bool,
-    last_extract_time: std::sync::Mutex<std::time::Instant>,
+    last_extract_ms: AtomicI64,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
 }
 
@@ -280,9 +133,7 @@ impl Agent {
             audit: None,
             tool_selector: RwLock::new(None),
             auto_extract: false,
-            last_extract_time: std::sync::Mutex::new(
-                std::time::Instant::now() - std::time::Duration::from_secs(60)
-            ),
+            last_extract_ms: AtomicI64::new(0),
             mcp_manager: None,
         }
     }
@@ -501,15 +352,16 @@ impl Agent {
         };
 
         // Rate limit: skip if last extraction was less than 30 seconds ago
-        {
-            let mut last = self.last_extract_time.lock().unwrap();
-            let now = std::time::Instant::now();
-            if now.duration_since(*last) < std::time::Duration::from_secs(30) {
-                log::debug!("Auto-extract: rate limited, skipping");
-                return;
-            }
-            *last = now;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let last_ms = self.last_extract_ms.load(Ordering::Relaxed);
+        if now_ms - last_ms < 30_000 {
+            log::debug!("Auto-extract: rate limited, skipping");
+            return;
         }
+        self.last_extract_ms.store(now_ms, Ordering::Relaxed);
 
         // Heuristic pre-filter: skip trivial messages
         let trimmed = user_message.trim();
@@ -521,8 +373,8 @@ impl Agent {
         let provider = self.provider.clone();
         let msg = user_message.to_string();
 
-        tokio::spawn(async move {
-            extract_facts(provider, &memory_dir, &msg).await;
+        spawn_background("fact_extraction", async move {
+            extraction::extract_facts(provider, &memory_dir, &msg).await;
         });
     }
 
@@ -552,8 +404,8 @@ impl Agent {
         let conv_id = conversation_id.to_string();
         let threshold = self.summary_threshold;
 
-        tokio::spawn(async move {
-            summarize_conversation(provider, storage, &memory_dir, &conv_id, threshold).await;
+        spawn_background("summarization", async move {
+            history::summarize_conversation(provider, storage, &memory_dir, &conv_id, threshold).await;
         });
     }
 
@@ -603,6 +455,35 @@ impl Agent {
     /// Prepare conversation messages: store user message, load & sanitize history,
     /// prepend system prompt / preferences / summary.
     /// Returns (messages, history_message_count).
+    /// Call provider.chat() with a timeout to prevent indefinite hangs.
+    async fn chat_with_timeout(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(LLM_TIMEOUT_SECS),
+            self.provider.chat(messages, tools),
+        )
+        .await
+        .map_err(|_| LlmError::ApiError(format!("LLM call timed out after {LLM_TIMEOUT_SECS}s")))?
+    }
+
+    /// Call provider.chat_stream() with a timeout.
+    async fn chat_stream_with_timeout(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<LlmResponse, LlmError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(LLM_TIMEOUT_SECS),
+            self.provider.chat_stream(messages, tools, tx),
+        )
+        .await
+        .map_err(|_| LlmError::ApiError(format!("LLM stream timed out after {LLM_TIMEOUT_SECS}s")))?
+    }
+
     async fn prepare_messages(
         &self,
         conversation_id: &str,
@@ -857,7 +738,7 @@ impl Agent {
             log::info!("Iteration {}/{}", iteration + 1, self.max_iterations);
 
             let llm_start = langfuse::timestamp();
-            let response = self.provider.chat(&messages, &tool_definitions).await?;
+            let response = self.chat_with_timeout(&messages, &tool_definitions).await?;
             let llm_end = langfuse::timestamp();
             self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
 
@@ -955,7 +836,7 @@ impl Agent {
         // Forced conclusion
         log::warn!("Max iterations ({}) exceeded, forcing conclusion", self.max_iterations);
         let llm_start = langfuse::timestamp();
-        let response = self.provider.chat(&messages, &[]).await?;
+        let response = self.chat_with_timeout(&messages, &[]).await?;
         let llm_end = langfuse::timestamp();
         self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
 
@@ -1036,10 +917,9 @@ impl Agent {
 
             let llm_start = langfuse::timestamp();
             let response = if pending_review {
-                self.provider.chat(&messages, &tool_definitions).await?
+                self.chat_with_timeout(&messages, &tool_definitions).await?
             } else {
-                self.provider
-                    .chat_stream(&messages, &tool_definitions, event_tx.clone())
+                self.chat_stream_with_timeout(&messages, &tool_definitions, event_tx.clone())
                     .await?
             };
             let llm_end = langfuse::timestamp();
@@ -1164,8 +1044,7 @@ impl Agent {
         log::warn!("Stream: max iterations ({}) exceeded, forcing conclusion", self.max_iterations);
         let llm_start = langfuse::timestamp();
         let response = self
-            .provider
-            .chat_stream(&messages, &[], event_tx.clone())
+            .chat_stream_with_timeout(&messages, &[], event_tx.clone())
             .await?;
         let llm_end = langfuse::timestamp();
         self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
@@ -1178,270 +1057,6 @@ impl Agent {
         self.finalize_response(conversation_id, &content).await?;
         let _ = event_tx.send(StreamEvent::Done(content.clone()));
         Ok(content)
-    }
-}
-
-/// Background task: summarize a conversation if it exceeds the threshold.
-/// Uses sliding window: only older messages are summarized, recent ones are kept intact.
-async fn summarize_conversation(
-    provider: Arc<dyn LlmProvider>,
-    storage: Arc<dyn ConversationStorage>,
-    memory_dir: &std::path::Path,
-    conversation_id: &str,
-    summary_threshold: usize,
-) {
-    let history = match storage.get_history(conversation_id).await {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-
-    if history.len() < summary_threshold {
-        return;
-    }
-
-    // Split: summarize the older part, keep the recent part.
-    // Adjust split point so we never orphan a ToolResult from its tool_call.
-    let mut split_point = history.len().saturating_sub(KEEP_RECENT_MESSAGES);
-    while split_point > 0 {
-        if let Message::ToolResult { .. } = &history[split_point] {
-            split_point -= 1;
-        } else {
-            break;
-        }
-    }
-    let to_summarize = &history[..split_point];
-    let to_keep: Vec<Message> = history[split_point..].to_vec();
-
-    log::info!(
-        "Conversation '{}' has {} messages, summarizing (keeping last {})...",
-        conversation_id,
-        history.len(),
-        to_keep.len(),
-    );
-
-    let summary_dir = memory_dir.join("conversations");
-    let summary_path = summary_dir.join(format!("{conversation_id}.md"));
-    let prefs_path = memory_dir.join("preferences.md");
-
-    // Include previous summary so we don't lose older context
-    let previous = std::fs::read_to_string(&summary_path).unwrap_or_default();
-
-    let formatted_history = format_history_for_summary(to_summarize);
-
-    // Build summary input
-    let mut summary_input = String::new();
-    if !previous.trim().is_empty() {
-        summary_input.push_str("[Previous context summary]\n");
-        summary_input.push_str(&previous);
-        summary_input.push_str("\n\n[New conversation to incorporate]\n");
-    }
-    summary_input.push_str(&formatted_history);
-
-    let summary_messages = vec![
-        Message::System(SUMMARY_PROMPT.to_string()),
-        Message::User(summary_input),
-    ];
-
-    // Build preferences input
-    let existing_prefs = std::fs::read_to_string(&prefs_path).unwrap_or_default();
-    let mut prefs_input = String::new();
-    if !existing_prefs.trim().is_empty() {
-        prefs_input.push_str("[Existing user preferences]\n");
-        prefs_input.push_str(&existing_prefs);
-        prefs_input.push_str("\n\n[New conversation to analyze]\n");
-    }
-    prefs_input.push_str(&formatted_history);
-
-    let prefs_messages = vec![
-        Message::System(PREFERENCES_PROMPT.to_string()),
-        Message::User(prefs_input),
-    ];
-
-    // Run both LLM calls in parallel
-    let provider2 = provider.clone();
-    let (summary_result, prefs_result) = tokio::join!(
-        provider.chat(&summary_messages, &[]),
-        provider2.chat(&prefs_messages, &[]),
-    );
-
-    // Write summary and re-add recent messages
-    match summary_result {
-        Ok(response) => {
-            if let Some(summary) = response.content {
-                let _ = std::fs::create_dir_all(&summary_dir);
-                if std::fs::write(&summary_path, &summary).is_ok() {
-                    let _ = storage.clear(conversation_id).await;
-                    // Re-add recent messages to preserve active context
-                    for msg in &to_keep {
-                        if let Err(e) = storage.add_message(conversation_id, msg).await {
-                            log::warn!("Failed to re-add kept message: {e}");
-                        }
-                    }
-                    log::info!(
-                        "Conversation '{}' summarized: removed {} old messages, kept {}",
-                        conversation_id,
-                        split_point,
-                        to_keep.len(),
-                    );
-                } else {
-                    log::warn!("Failed to write summary file for '{}'", conversation_id);
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to summarize '{}': {e}", conversation_id);
-        }
-    }
-
-    // Write preferences
-    match prefs_result {
-        Ok(response) => {
-            if let Some(prefs) = response.content {
-                let trimmed = prefs.trim();
-                if trimmed == "NO_UPDATE" || trimmed.is_empty() {
-                    log::info!("No new user preferences extracted");
-                } else if std::fs::write(&prefs_path, &prefs).is_ok() {
-                    log::info!("User preferences updated ({} chars)", prefs.len());
-                } else {
-                    log::warn!("Failed to write preferences file");
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to extract preferences: {e}");
-        }
-    }
-
-    // Consolidate facts if they've grown large
-    let facts_path = memory_dir.join("facts.md");
-    if let Ok(facts_content) = std::fs::read_to_string(&facts_path) {
-        if facts_content.len() > 6000 {
-            log::info!("Facts file large ({} chars), consolidating...", facts_content.len());
-            let consolidate_messages = vec![
-                Message::System(CONSOLIDATE_FACTS_PROMPT.to_string()),
-                Message::User(facts_content),
-            ];
-            if let Ok(response) = provider.chat(&consolidate_messages, &[]).await {
-                if let Some(consolidated) = response.content {
-                    let out = format!("# User Facts\n\n{}\n", consolidated.trim());
-                    if std::fs::write(&facts_path, &out).is_ok() {
-                        log::info!("Facts consolidated ({} chars)", consolidated.len());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Background task: extract durable facts from a user message.
-async fn extract_facts(
-    provider: Arc<dyn LlmProvider>,
-    memory_dir: &std::path::Path,
-    user_message: &str,
-) {
-    let facts_path = memory_dir.join("facts.md");
-    let existing_facts = std::fs::read_to_string(&facts_path).unwrap_or_default();
-
-    let mut input = String::new();
-    if !existing_facts.trim().is_empty() {
-        input.push_str("[Existing facts — do NOT repeat these]\n");
-        input.push_str(&existing_facts);
-        input.push_str("\n\n");
-    }
-    input.push_str("[User message to analyze]\n");
-    input.push_str(user_message);
-
-    let messages = vec![
-        Message::System(EXTRACT_FACTS_PROMPT.to_string()),
-        Message::User(input),
-    ];
-
-    match provider.chat(&messages, &[]).await {
-        Ok(response) => {
-            if let Some(facts) = response.content {
-                let trimmed = facts.trim();
-                if trimmed == "NO_FACTS" || trimmed.is_empty() {
-                    log::debug!("Auto-extract: no new facts found");
-                    return;
-                }
-
-                let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                let entry = format!("\n## {timestamp}\n{trimmed}\n");
-
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&facts_path)
-                {
-                    Ok(mut file) => {
-                        use std::io::Write;
-                        if let Err(e) = file.write_all(entry.as_bytes()) {
-                            log::warn!("Auto-extract: failed to write facts: {e}");
-                        } else {
-                            log::info!("Auto-extract: saved new facts ({} chars)", trimmed.len());
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Auto-extract: failed to open facts.md: {e}");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("Auto-extract: LLM call failed: {e}");
-        }
-    }
-}
-
-fn format_history_for_summary(messages: &[Message]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for msg in messages {
-        match msg {
-            Message::System(_) => {}
-            Message::User(content) => {
-                parts.push(format!("User: {}", truncate_for_summary(content, 500)));
-            }
-            Message::UserMultimodal { parts: msg_parts } => {
-                let text: String = msg_parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        crate::core::ContentPart::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let label = if msg_parts.iter().any(|p| matches!(p, crate::core::ContentPart::ImageBase64 { .. })) {
-                    "User [with image]"
-                } else {
-                    "User"
-                };
-                parts.push(format!("{label}: {}", truncate_for_summary(&text, 500)));
-            }
-            Message::Assistant {
-                content,
-                tool_calls,
-            } => {
-                if let Some(c) = content {
-                    parts.push(format!("Assistant: {}", truncate_for_summary(c, 500)));
-                }
-                for tc in tool_calls {
-                    parts.push(format!("[Used tool: {}]", tc.name));
-                }
-            }
-            Message::ToolResult { content, .. } => {
-                parts.push(format!(
-                    "[Tool output: {}]",
-                    truncate_for_summary(content, 150)
-                ));
-            }
-        }
-    }
-    let text = parts.join("\n");
-    if text.len() > 8000 {
-        let end = text.floor_char_boundary(8000);
-        format!("{}...\n\n[Truncated]", &text[..end])
-    } else {
-        text
     }
 }
 
@@ -1467,18 +1082,10 @@ fn system_info() -> String {
     )
 }
 
-fn truncate_for_summary(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(max);
-        format!("{}...", &s[..end])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::extraction::{extract_facts, is_trivial_reply};
     use crate::core::{LlmError, LlmResponse, Message, ToolDefinition};
     use crate::storage::in_memory::InMemoryStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1662,13 +1269,16 @@ mod tests {
             .with_auto_extract(true)
             .with_memory_dir(dir.path().to_path_buf());
 
-        // First call should update last_extract_time
+        // First call should update last_extract_ms
         agent.spawn_extract("This is a long enough message to pass filter");
 
-        // Verify the time was updated recently
-        let last = agent.last_extract_time.lock().unwrap();
-        let elapsed = last.elapsed();
-        assert!(elapsed < std::time::Duration::from_secs(1));
+        // Verify the timestamp was updated recently
+        let last_ms = agent.last_extract_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(now_ms - last_ms < 1000);
     }
 
     #[tokio::test]

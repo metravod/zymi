@@ -4,6 +4,8 @@ pub mod approval;
 pub mod chatgpt;
 pub mod config;
 pub mod debug_provider;
+pub mod extraction;
+pub mod history;
 pub mod langfuse;
 pub mod openai;
 pub mod provider_manager;

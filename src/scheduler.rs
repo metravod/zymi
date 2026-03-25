@@ -12,6 +12,7 @@ use crate::connectors::telegram::allowed_users;
 use crate::core::agent::Agent;
 use crate::core::LlmProvider;
 use crate::policy::PolicyEngine;
+use crate::sandbox::{ExecutionContext, SandboxManager};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::tools::current_time::CurrentTimeTool;
 use crate::tools::memory::{ReadMemoryTool, WriteMemoryTool};
@@ -100,6 +101,7 @@ async fn execute_entry(
     system_prompt: &str,
     policy_engine: &Arc<PolicyEngine>,
     audit: &AuditLog,
+    sandbox: Option<&Arc<SandboxManager>>,
 ) -> String {
     log::info!(
         "Executing scheduled task '{}' ({}): {}",
@@ -109,11 +111,18 @@ async fn execute_entry(
     );
     let start = std::time::Instant::now();
 
+    let shell = {
+        let mut s = ShellTool::new().with_policy(policy_engine.clone());
+        if let Some(sb) = sandbox {
+            s = s.with_sandbox(sb.clone(), ExecutionContext::Scheduler);
+        }
+        s
+    };
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(CurrentTimeTool),
         Box::new(ReadMemoryTool::new(memory_dir.to_path_buf())),
         Box::new(WriteMemoryTool::new(memory_dir.to_path_buf())),
-        Box::new(ShellTool::new().with_policy(policy_engine.clone())),
+        Box::new(shell),
     ];
 
     let storage = Arc::new(InMemoryStorage::new());
@@ -171,6 +180,7 @@ pub async fn run(
     policy_engine: Arc<PolicyEngine>,
     audit: AuditLog,
     shutdown: tokio_util::sync::CancellationToken,
+    sandbox: Option<Arc<SandboxManager>>,
 ) {
     let bot = crate::connectors::telegram::bot_with_timeout();
     log::info!("Scheduler started");
@@ -202,7 +212,7 @@ pub async fn run(
 
             let response = execute_entry(
                 entry, &provider, &memory_dir, &system_prompt,
-                &policy_engine, &audit,
+                &policy_engine, &audit, sandbox.as_ref(),
             ).await;
 
             let message = format!("⏰ [{}]\n\n{}", entry.name, response);

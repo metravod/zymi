@@ -1,20 +1,29 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::core::ToolDefinition;
+use crate::sandbox::SandboxManager;
 
 use super::Tool;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_CODE_LENGTH: usize = 50_000;
 
-pub struct RunCodeTool;
+pub struct RunCodeTool {
+    sandbox: Option<Arc<SandboxManager>>,
+}
 
 impl RunCodeTool {
     pub fn new() -> Self {
-        Self
+        Self { sandbox: None }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxManager>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 }
 
@@ -108,7 +117,7 @@ impl Tool for RunCodeTool {
             .map_err(|e| format!("Failed to write temp file: {e}"))?;
 
         // Execute
-        let result = run_script(interpreter, &file_path, timeout_secs).await;
+        let result = run_script(interpreter, &file_path, timeout_secs, self.sandbox.as_deref()).await;
 
         // Cleanup
         let _ = tokio::fs::remove_file(&file_path).await;
@@ -121,10 +130,22 @@ async fn run_script(
     interpreter: &str,
     file_path: &std::path::Path,
     timeout_secs: u64,
+    sandbox: Option<&SandboxManager>,
 ) -> Result<String, String> {
-    let child_future = Command::new(interpreter)
-        .arg(file_path)
-        .output();
+    use crate::sandbox::ExecutionContext;
+
+    let child_future = if let Some(sb) = sandbox.filter(|s| s.is_active()) {
+        let sandboxed =
+            sb.wrap_script(ExecutionContext::RunCode, interpreter, file_path, None);
+        let mut cmd = Command::new(&sandboxed.program);
+        cmd.args(&sandboxed.args);
+        for (k, v) in &sandboxed.env {
+            cmd.env(k, v);
+        }
+        cmd.output()
+    } else {
+        Command::new(interpreter).arg(file_path).output()
+    };
 
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child_future)
         .await

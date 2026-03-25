@@ -7,6 +7,7 @@ mod eval;
 mod git_sync;
 mod mcp;
 mod policy;
+mod sandbox;
 mod scheduler;
 mod setup;
 mod storage;
@@ -279,6 +280,7 @@ struct App {
     ask_user_rx: mpsc::UnboundedReceiver<tools::ask_user::UserQuestion>,
     policy_engine: Arc<policy::PolicyEngine>,
     audit_log: audit::AuditLog,
+    sandbox: Arc<sandbox::SandboxManager>,
 }
 
 async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
@@ -327,6 +329,10 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
     let policy_config = policy::load_policy(&memory_dir);
     let policy_engine = Arc::new(policy::PolicyEngine::new(policy_config));
 
+    // Sandbox for shell command isolation
+    let sandbox_config = sandbox::load_sandbox_config(&memory_dir);
+    let sandbox_manager = Arc::new(sandbox::SandboxManager::new(sandbox_config).await);
+
     let (ask_user_tx, ask_user_rx) = mpsc::unbounded_channel();
 
     let mut tools: Vec<Box<dyn Tool>> = vec![
@@ -338,21 +344,28 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         Box::new(
             ShellTool::new()
                 .with_task_registry(task_registry.clone())
-                .with_policy(policy_engine.clone()),
+                .with_policy(policy_engine.clone())
+                .with_sandbox(sandbox_manager.clone(), sandbox::ExecutionContext::Interactive),
         ),
-        Box::new(RunCodeTool::new()),
-        Box::new(SpawnSubAgentTool::new(
-            provider.clone(),
-            memory_dir.clone(),
-            shared_approval_handler.clone(),
-        )),
+        Box::new(RunCodeTool::new().with_sandbox(sandbox_manager.clone())),
+        Box::new(
+            SpawnSubAgentTool::new(
+                provider.clone(),
+                memory_dir.clone(),
+                shared_approval_handler.clone(),
+            )
+            .with_sandbox(sandbox_manager.clone()),
+        ),
         Box::new(CreateSubAgentTool::new(memory_dir.clone())),
-        Box::new(SpawnTaskTool::new(
-            provider.clone(),
-            memory_dir.clone(),
-            shared_approval_handler.clone(),
-            task_registry.clone(),
-        )),
+        Box::new(
+            SpawnTaskTool::new(
+                provider.clone(),
+                memory_dir.clone(),
+                shared_approval_handler.clone(),
+                task_registry.clone(),
+            )
+            .with_sandbox(sandbox_manager.clone()),
+        ),
         Box::new(CheckTaskTool::new(task_registry.clone())),
         Box::new(ListTasksTool::new(task_registry.clone())),
         Box::new(ManageScheduleTool::new(memory_dir.clone())),
@@ -397,12 +410,15 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         })
         .collect();
 
-    let workflow_engine = Arc::new(WorkflowEngine::new(
-        provider.clone(),
-        memory_dir.clone(),
-        available_tools,
-        shared_approval_handler.clone(),
-    ));
+    let workflow_engine = Arc::new(
+        WorkflowEngine::new(
+            provider.clone(),
+            memory_dir.clone(),
+            available_tools,
+            shared_approval_handler.clone(),
+        )
+        .with_sandbox(sandbox_manager.clone()),
+    );
 
     let langfuse = LangfuseConfig::from_env().map(LangfuseClient::new);
     let default_model_id = models_config
@@ -492,6 +508,7 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         ask_user_rx,
         policy_engine,
         audit_log,
+        sandbox: sandbox_manager,
     })
 }
 
@@ -673,6 +690,7 @@ async fn main() -> Result<()> {
                 app.policy_engine.clone(),
                 app.audit_log.clone(),
                 shutdown.clone(),
+                Some(app.sandbox.clone()),
             )));
 
             if has_telegram {

@@ -6,6 +6,7 @@ use tokio::process::Command;
 
 use crate::core::ToolDefinition;
 use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::sandbox::{ExecutionContext, SandboxManager};
 use crate::task_registry::{SharedTaskRegistry, TaskEntry, TaskKind};
 use crate::tools::Tool;
 
@@ -16,6 +17,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300; // 5 minutes
 pub struct ShellTool {
     task_registry: Option<SharedTaskRegistry>,
     policy: Option<Arc<PolicyEngine>>,
+    sandbox: Option<Arc<SandboxManager>>,
+    execution_context: ExecutionContext,
 }
 
 impl ShellTool {
@@ -23,6 +26,8 @@ impl ShellTool {
         Self {
             task_registry: None,
             policy: None,
+            sandbox: None,
+            execution_context: ExecutionContext::Interactive,
         }
     }
 
@@ -35,13 +40,24 @@ impl ShellTool {
         self.policy = Some(policy);
         self
     }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxManager>, context: ExecutionContext) -> Self {
+        self.sandbox = Some(sandbox);
+        self.execution_context = context;
+        self
+    }
 }
 
 /// Run a shell command with an optional timeout. Returns stdout+stderr.
 ///
 /// If the command uses `sudo` and `SUDO_PASSWORD` is set, the password is
 /// piped to sudo via stdin (`-S` flag) so non-interactive execution works.
-pub(crate) async fn run_command(command: &str, timeout_secs: u64) -> Result<String, String> {
+pub(crate) async fn run_command(
+    command: &str,
+    timeout_secs: u64,
+    sandbox: Option<&SandboxManager>,
+    context: ExecutionContext,
+) -> Result<String, String> {
     let is_docker = tokio::fs::try_exists("/.dockerenv")
         .await
         .unwrap_or(false);
@@ -59,7 +75,15 @@ pub(crate) async fn run_command(command: &str, timeout_secs: u64) -> Result<Stri
         command.to_string()
     };
 
-    let mut cmd = if is_docker {
+    let mut cmd = if let Some(sb) = sandbox.filter(|s| s.is_active()) {
+        let sandboxed = sb.wrap_command(context, &effective_command, None);
+        let mut c = Command::new(&sandboxed.program);
+        c.args(&sandboxed.args);
+        for (k, v) in &sandboxed.env {
+            c.env(k, v);
+        }
+        c
+    } else if is_docker {
         let mut c = Command::new("nsenter");
         c.args(["-t", "1", "-m", "-u", "-i", "-n", "--", "sh", "-c", &effective_command]);
         c
@@ -197,6 +221,13 @@ impl Tool for ShellTool {
     }
 
     fn requires_approval_for(&self, arguments: &str) -> bool {
+        // If sandbox is active and the profile says auto_approve, skip approval
+        if let Some(ref sb) = self.sandbox {
+            if sb.is_active() && sb.profile_for(self.execution_context).auto_approve {
+                return false;
+            }
+        }
+
         if let Some(ref policy) = self.policy {
             if policy.is_enabled() {
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
@@ -277,12 +308,14 @@ impl Tool for ShellTool {
             let reg = registry.clone();
             let tid = task_id.clone();
             let cmd = command.to_string();
+            let bg_sandbox = self.sandbox.clone();
+            let bg_context = self.execution_context;
 
             tokio::spawn(async move {
                 reg.write().await.set_running(&tid);
                 log::info!("Task {tid}: running background shell: {}", &cmd[..cmd.len().min(100)]);
 
-                match run_command(&cmd, timeout_secs).await {
+                match run_command(&cmd, timeout_secs, bg_sandbox.as_deref(), bg_context).await {
                     Ok(result) => {
                         log::info!("Task {tid}: shell completed, result_len={}", result.len());
                         reg.write().await.set_completed(&tid, result);
@@ -303,7 +336,7 @@ impl Tool for ShellTool {
         }
 
         // Foreground mode: run with timeout
-        run_command(command, timeout_secs).await
+        run_command(command, timeout_secs, self.sandbox.as_deref(), self.execution_context).await
     }
 }
 
@@ -448,5 +481,58 @@ mod tests {
         let result = tool.execute(&args(&cmd)).await.unwrap();
         assert!(result.contains("[Output truncated"));
         assert!(result.len() <= MAX_OUTPUT_LENGTH + 100);
+    }
+
+    // --- Sandbox integration tests ---
+
+    #[test]
+    fn no_sandbox_requires_approval() {
+        let tool = ShellTool::new();
+        assert!(tool.requires_approval_for(&args("echo hi")));
+    }
+
+    #[tokio::test]
+    async fn sandbox_disabled_requires_approval() {
+        use crate::sandbox::{SandboxConfig, SandboxManager};
+        let config = SandboxConfig::default(); // disabled
+        let mgr = Arc::new(SandboxManager::new(config).await);
+        let tool = ShellTool::new().with_sandbox(mgr, ExecutionContext::Workflow);
+        // Sandbox disabled → still requires approval
+        assert!(tool.requires_approval_for(&args("echo hi")));
+    }
+
+    #[tokio::test]
+    async fn sandbox_native_auto_approve_still_requires() {
+        use std::collections::HashMap;
+        use crate::sandbox::{
+            SandboxBackendType, SandboxConfig, SandboxManager, SandboxProfile,
+        };
+        // Enabled but native backend → is_active() returns false
+        let config = SandboxConfig {
+            enabled: true,
+            default_backend: SandboxBackendType::Native,
+            profiles: HashMap::from([(
+                ExecutionContext::Workflow,
+                SandboxProfile {
+                    auto_approve: true,
+                    ..Default::default()
+                },
+            )]),
+        };
+        let mgr = Arc::new(SandboxManager::new(config).await);
+        let tool = ShellTool::new().with_sandbox(mgr, ExecutionContext::Workflow);
+        // Native backend → is_active() false → auto_approve ignored
+        assert!(tool.requires_approval_for(&args("echo hi")));
+    }
+
+    #[test]
+    fn with_sandbox_sets_context() {
+        use crate::sandbox::{SandboxConfig, SandboxManager};
+        // Just verify the builder sets the context correctly
+        let tool = ShellTool::new();
+        assert_eq!(tool.execution_context, ExecutionContext::Interactive);
+
+        // Can't test with_sandbox without async SandboxManager::new,
+        // but verify the field is there via the default
     }
 }

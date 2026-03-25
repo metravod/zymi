@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::core::approval::SharedApprovalHandler;
 use crate::core::{LlmProvider, Message, StreamEvent};
+use crate::sandbox::SandboxManager;
 
 pub use self::node::{NodeResult, NodeStatus};
 
@@ -65,6 +66,7 @@ pub struct WorkflowEngine {
     memory_dir: PathBuf,
     available_tools: Vec<ToolInfo>,
     approval_handler: SharedApprovalHandler,
+    sandbox: Option<Arc<SandboxManager>>,
 }
 
 impl WorkflowEngine {
@@ -79,7 +81,13 @@ impl WorkflowEngine {
             memory_dir,
             available_tools,
             approval_handler,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxManager>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 
     /// Run the full workflow pipeline: assess → plan → DAG → execute → synthesize.
@@ -174,11 +182,14 @@ impl WorkflowEngine {
         }
 
         // 4. Execute
-        let exec = executor::DagExecutor::new(
+        let mut exec = executor::DagExecutor::new(
             &self.provider,
             &self.memory_dir,
             self.approval_handler.clone(),
         );
+        if let Some(ref sb) = self.sandbox {
+            exec = exec.with_sandbox(sb.clone());
+        }
         let dag_result = exec.execute(dag, event_tx.clone()).await?;
 
         let new_mcp_servers = dag_result.new_mcp_servers.clone();

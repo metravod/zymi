@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use crate::core::agent::Agent;
 use crate::core::approval::{ContextualApprovalHandler, SharedApprovalHandler};
 use crate::core::{LlmProvider, ToolDefinition};
+use crate::sandbox::{ExecutionContext, SandboxManager};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::task_registry::{new_task_registry, SharedTaskRegistry, TaskEntry, TaskKind, TaskStatus};
 use crate::tools::current_time::CurrentTimeTool;
@@ -27,6 +28,7 @@ pub struct SpawnTaskTool {
     subagents_dir: PathBuf,
     approval_handler: SharedApprovalHandler,
     registry: SharedTaskRegistry,
+    sandbox: Option<Arc<SandboxManager>>,
 }
 
 impl SpawnTaskTool {
@@ -43,7 +45,13 @@ impl SpawnTaskTool {
             subagents_dir,
             approval_handler,
             registry,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxManager>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 
     fn list_available_agents(&self) -> Vec<String> {
@@ -159,6 +167,7 @@ impl Tool for SpawnTaskTool {
         let approval_handler = self.approval_handler.clone();
         let agent_name_owned = agent_name.to_string();
         let tid = task_id.clone();
+        let sandbox = self.sandbox.clone();
 
         tokio::spawn(async move {
             // Mark running
@@ -168,11 +177,18 @@ impl Tool for SpawnTaskTool {
 
             // Build sub-agent tools — same as SpawnSubAgentTool but with task registry
             let sub_registry = new_task_registry();
+            let shell = {
+                let mut s = ShellTool::new().with_task_registry(sub_registry);
+                if let Some(ref sb) = sandbox {
+                    s = s.with_sandbox(sb.clone(), ExecutionContext::SubAgent);
+                }
+                s
+            };
             let mut tools: Vec<Box<dyn Tool>> = vec![
                 Box::new(CurrentTimeTool),
                 Box::new(ReadMemoryTool::new(memory_dir.clone())),
                 Box::new(WriteMemoryTool::new(memory_dir.clone())),
-                Box::new(ShellTool::new().with_task_registry(sub_registry)),
+                Box::new(shell),
             ];
 
             if let Some(tool) = WebSearchTool::new() {

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::service::Peer;
@@ -5,6 +7,12 @@ use rmcp::service::RoleClient;
 
 use crate::core::ToolDefinition;
 use crate::tools::Tool;
+
+/// Maximum time an MCP tool call may take before being cancelled.
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum response text length (characters). Responses exceeding this are truncated.
+const MCP_MAX_RESPONSE_LEN: usize = 100_000;
 
 pub struct McpTool {
     prefixed_name: String,
@@ -57,23 +65,31 @@ impl Tool for McpTool {
             serde_json::from_str(arguments).map_err(|e| format!("Invalid JSON arguments: {e}"))?
         };
 
-        let result = self
-            .peer
-            .call_tool(CallToolRequestParams {
+        let result = tokio::time::timeout(
+            MCP_CALL_TIMEOUT,
+            self.peer.call_tool(CallToolRequestParams {
                 meta: None,
                 name: self.original_name.clone().into(),
                 arguments: args,
                 task: None,
-            })
-            .await
-            .map_err(|e| format!("MCP call_tool error: {e}"))?;
+            }),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "MCP tool '{}' timed out after {}s",
+                self.original_name,
+                MCP_CALL_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("MCP call_tool error: {e}"))?;
 
         if result.is_error == Some(true) {
             let text = extract_text(&result.content);
-            return Err(text);
+            return Err(truncate_response(text));
         }
 
-        Ok(extract_text(&result.content))
+        Ok(truncate_response(extract_text(&result.content)))
     }
 
     fn requires_approval(&self) -> bool {
@@ -90,4 +106,43 @@ fn extract_text(content: &[rmcp::model::Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn truncate_response(s: String) -> String {
+    if s.len() <= MCP_MAX_RESPONSE_LEN {
+        s
+    } else {
+        let end = s.floor_char_boundary(MCP_MAX_RESPONSE_LEN);
+        format!(
+            "{}...\n[MCP response truncated: {} total chars, limit {}]",
+            &s[..end],
+            s.len(),
+            MCP_MAX_RESPONSE_LEN
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_response_short() {
+        let s = "hello world".to_string();
+        assert_eq!(truncate_response(s.clone()), s);
+    }
+
+    #[test]
+    fn truncate_response_at_limit() {
+        let s = "a".repeat(MCP_MAX_RESPONSE_LEN);
+        assert_eq!(truncate_response(s.clone()), s);
+    }
+
+    #[test]
+    fn truncate_response_over_limit() {
+        let s = "a".repeat(MCP_MAX_RESPONSE_LEN + 500);
+        let result = truncate_response(s);
+        assert!(result.contains("[MCP response truncated:"));
+        assert!(result.len() < MCP_MAX_RESPONSE_LEN + 200);
+    }
 }

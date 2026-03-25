@@ -188,3 +188,159 @@ impl Tool for ManageScheduleTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tool(dir: &std::path::Path) -> ManageScheduleTool {
+        ManageScheduleTool::new(dir.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn handle_create_cron() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "daily check",
+            "task": "check status",
+            "cron": "0 9 * * *"
+        });
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Created scheduled task"));
+        assert!(result.contains("daily check"));
+        assert!(result.contains("cron: 0 9 * * *"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_once_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "one-time",
+            "task": "run migration",
+            "once_at": "2026-12-01T10:00:00Z"
+        });
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Created scheduled task"));
+        assert!(result.contains("once_at:"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_missing_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "bad",
+            "task": "something"
+        });
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cron"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_both_provided() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "both",
+            "task": "do",
+            "cron": "* * * * *",
+            "once_at": "2026-12-01T10:00:00Z"
+        });
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Only one"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_invalid_cron() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "bad-cron",
+            "task": "do",
+            "cron": "not a cron"
+        });
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid cron"));
+    }
+
+    #[tokio::test]
+    async fn handle_list_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(r#"{"action":"list"}"#).await.unwrap();
+        assert_eq!(result, "No scheduled tasks.");
+    }
+
+    #[tokio::test]
+    async fn handle_list_with_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+
+        // Create an entry first
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "test-task",
+            "task": "hello",
+            "cron": "*/5 * * * *"
+        });
+        tool.execute(&args.to_string()).await.unwrap();
+
+        let result = tool.execute(r#"{"action":"list"}"#).await.unwrap();
+        assert!(result.contains("Scheduled tasks (1):"));
+        assert!(result.contains("test-task"));
+        assert!(result.contains("*/5 * * * *"));
+    }
+
+    #[tokio::test]
+    async fn handle_delete_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+
+        // Create an entry
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "to-delete",
+            "task": "hello",
+            "cron": "* * * * *"
+        });
+        let create_result = tool.execute(&args.to_string()).await.unwrap();
+
+        // Extract id from output
+        let id = create_result
+            .lines()
+            .find(|l| l.contains("id:"))
+            .unwrap()
+            .split("id:")
+            .nth(1)
+            .unwrap()
+            .trim();
+
+        let del = serde_json::json!({"action":"delete","id":id});
+        let result = tool.execute(&del.to_string()).await.unwrap();
+        assert!(result.contains("Deleted"));
+
+        // Verify empty
+        let list = tool.execute(r#"{"action":"list"}"#).await.unwrap();
+        assert_eq!(list, "No scheduled tasks.");
+    }
+
+    #[tokio::test]
+    async fn handle_delete_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({"action":"delete","id":"nonexistent"});
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+}

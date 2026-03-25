@@ -212,3 +212,194 @@ impl Tool for ManageMcpTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tool(dir: &std::path::Path) -> ManageMcpTool {
+        ManageMcpTool::new(dir.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn handle_list_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(r#"{"action":"list"}"#).await.unwrap();
+        assert_eq!(result, "No MCP servers configured.");
+    }
+
+    #[tokio::test]
+    async fn handle_list_with_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({
+            "mcpServers": {
+                "github": {"command": "npx", "args": ["-y", "@mcp/github"]},
+                "slack": {"url": "http://localhost:3001"}
+            }
+        });
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let tool = make_tool(dir.path());
+        let result = tool.execute(r#"{"action":"list"}"#).await.unwrap();
+        assert!(result.contains("MCP servers (2):"));
+        assert!(result.contains("github:"));
+        assert!(result.contains("slack:"));
+    }
+
+    #[tokio::test]
+    async fn handle_add_command_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "github",
+            "command": "npx",
+            "args": ["-y", "@mcp/github"]
+        });
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Added"));
+        assert!(result.contains("github"));
+
+        // Verify file content
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["mcpServers"]["github"]["command"], "npx");
+    }
+
+    #[tokio::test]
+    async fn handle_add_url_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "remote",
+            "url": "http://localhost:3000/mcp"
+        });
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Added"));
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["mcpServers"]["remote"]["url"],
+            "http://localhost:3000/mcp"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_add_with_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "myserver",
+            "command": "uvx",
+            "env": {"API_KEY": "secret123"}
+        });
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Added"));
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["mcpServers"]["myserver"]["env"]["API_KEY"],
+            "secret123"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_add_updates_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+
+        // Add first
+        let args = serde_json::json!({"action":"add","name":"srv","command":"old"});
+        tool.execute(&args.to_string()).await.unwrap();
+
+        // Update
+        let args = serde_json::json!({"action":"add","name":"srv","command":"new"});
+        let result = tool.execute(&args.to_string()).await.unwrap();
+        assert!(result.contains("Updated"));
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["mcpServers"]["srv"]["command"], "new");
+    }
+
+    #[tokio::test]
+    async fn handle_add_missing_command_and_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({"action":"add","name":"srv"});
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("command"));
+    }
+
+    #[tokio::test]
+    async fn handle_add_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+
+        for name in &["", "a/b", "a\\b", "a b"] {
+            let args = serde_json::json!({"action":"add","name":name,"command":"x"});
+            let result = tool.execute(&args.to_string()).await;
+            assert!(result.is_err(), "Expected error for name '{name}'");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_remove_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+
+        // Add then remove
+        let add = serde_json::json!({"action":"add","name":"srv","command":"x"});
+        tool.execute(&add.to_string()).await.unwrap();
+
+        let rm = serde_json::json!({"action":"remove","name":"srv"});
+        let result = tool.execute(&rm.to_string()).await.unwrap();
+        assert!(result.contains("Removed"));
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert!(config["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_remove_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let args = serde_json::json!({"action":"remove","name":"nope"});
+        let result = tool.execute(&args.to_string()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn execute_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute("not json").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_unknown_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(r#"{"action":"nope"}"#).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown action"));
+    }
+}

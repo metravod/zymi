@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::FutureExt;
 use petgraph::graph::NodeIndex;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::core::approval::SharedApprovalHandler;
 use crate::core::{LlmProvider, Message, StreamEvent, ToolDefinition};
+use crate::sandbox::{ExecutionContext, SandboxManager};
 use crate::tools::current_time::CurrentTimeTool;
 use crate::tools::memory::{ReadMemoryTool, WriteMemoryTool};
 use crate::tools::shell::ShellTool;
@@ -54,6 +56,7 @@ pub struct DagExecutor {
     provider: Arc<dyn LlmProvider>,
     memory_dir: PathBuf,
     approval_handler: SharedApprovalHandler,
+    sandbox: Option<Arc<SandboxManager>>,
 }
 
 /// Result of executing the full DAG: node results + per-node traces.
@@ -76,7 +79,21 @@ impl DagExecutor {
             provider: provider.clone(),
             memory_dir: memory_dir.to_path_buf(),
             approval_handler,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxManager>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    fn make_shell_tool(&self) -> ShellTool {
+        let mut shell = ShellTool::new();
+        if let Some(ref sb) = self.sandbox {
+            shell = shell.with_sandbox(sb.clone(), ExecutionContext::Workflow);
+        }
+        shell
     }
 
     /// Execute all nodes in the DAG, parallelizing independent nodes within
@@ -144,59 +161,85 @@ impl DagExecutor {
                 let tx = event_tx.clone();
                 let lvl = level_idx;
 
+                // Clone identifiers for the panic fallback path
+                let panic_node_id = node_id.clone();
+                let panic_kind_str = format!("{:?}", node.kind);
+                let panic_description = node.description.clone();
+
                 join_set.spawn(async move {
-                    let _ = tx.send(StreamEvent::WorkflowNodeStart {
-                        node_id: node_id.clone(),
-                        description: node.description.clone(),
-                    });
+                    let inner = std::panic::AssertUnwindSafe(async {
+                        let _ = tx.send(StreamEvent::WorkflowNodeStart {
+                            node_id: node_id.clone(),
+                            description: node.description.clone(),
+                        });
 
-                    let (mut result, mut trace) =
-                        exec.execute_node_traced(&node, &dep_context, lvl).await;
-                    let mut attempts: usize = 1;
-                    for attempt in 1..=node.max_retries as usize {
-                        if matches!(result.status, NodeStatus::Completed) {
-                            break;
+                        let (mut result, mut trace) =
+                            exec.execute_node_traced(&node, &dep_context, lvl).await;
+                        let mut attempts: usize = 1;
+                        for attempt in 1..=node.max_retries as usize {
+                            if matches!(result.status, NodeStatus::Completed) {
+                                break;
+                            }
+                            log::info!(
+                                "Node '{}' failed (attempt {}/{}), retrying...",
+                                node_id,
+                                attempt,
+                                node.max_retries as usize + 1
+                            );
+                            let retry_ctx = format!(
+                                "{dep_context}\n\nPrevious attempt failed: {}\nTry a different approach.",
+                                result.output
+                            );
+                            let r = exec.execute_node_traced(&node, &retry_ctx, lvl).await;
+                            result = r.0;
+                            trace = r.1;
+                            attempts += 1;
                         }
+
+                        let success = matches!(result.status, NodeStatus::Completed);
                         log::info!(
-                            "Node '{}' failed (attempt {}/{}), retrying...",
+                            "Node '{}' finished: success={}, {:.0}ms, {} iter, {} tools, {} attempt(s)",
                             node_id,
-                            attempt,
-                            node.max_retries as usize + 1
+                            success,
+                            trace.duration_ms,
+                            trace.iterations,
+                            trace.tool_calls.len(),
+                            attempts,
                         );
-                        let retry_ctx = format!(
-                            "{dep_context}\n\nPrevious attempt failed: {}\nTry a different approach.",
-                            result.output
-                        );
-                        let r = exec.execute_node_traced(&node, &retry_ctx, lvl).await;
-                        result = r.0;
-                        trace = r.1;
-                        attempts += 1;
-                    }
 
-                    let success = matches!(result.status, NodeStatus::Completed);
-                    log::info!(
-                        "Node '{}' finished: success={}, {:.0}ms, {} iter, {} tools, {} attempt(s)",
-                        node_id,
-                        success,
-                        trace.duration_ms,
-                        trace.iterations,
-                        trace.tool_calls.len(),
-                        attempts,
-                    );
+                        let _ = tx.send(StreamEvent::WorkflowNodeComplete {
+                            node_id: node_id.clone(),
+                            success,
+                        });
 
-                    let _ = tx.send(StreamEvent::WorkflowNodeComplete {
-                        node_id: node_id.clone(),
-                        success,
+                        // Track ConnectMcp server names for hot-reload
+                        let mcp_server = if success && matches!(node.kind, NodeKind::ConnectMcp) {
+                            node.mcp_server_name.clone()
+                        } else {
+                            None
+                        };
+
+                        (node_id, result, trace, mcp_server, attempts)
                     });
 
-                    // Track ConnectMcp server names for hot-reload
-                    let mcp_server = if success && matches!(node.kind, NodeKind::ConnectMcp) {
-                        node.mcp_server_name.clone()
-                    } else {
-                        None
-                    };
-
-                    (node_id, result, trace, mcp_server, attempts)
+                    match inner.catch_unwind().await {
+                        Ok(tuple) => tuple,
+                        Err(_panic) => {
+                            log::error!("Node '{}' panicked", panic_node_id);
+                            let ntb = NodeTraceBuilder::new(
+                                &panic_node_id,
+                                &panic_kind_str,
+                                &panic_description,
+                                lvl,
+                            );
+                            let trace = ntb.finish("failed", "task panicked");
+                            let result = NodeResult {
+                                output: "Node panicked (internal error)".to_string(),
+                                status: NodeStatus::Failed("task panicked".to_string()),
+                            };
+                            (panic_node_id, result, trace, None, 1)
+                        }
+                    }
                 });
             }
 
@@ -460,7 +503,7 @@ impl DagExecutor {
         let tool_start = std::time::Instant::now();
         let result = self
             .run_tool(
-                &[Box::new(ShellTool::new()) as Box<dyn Tool>],
+                &[Box::new(self.make_shell_tool()) as Box<dyn Tool>],
                 "execute_shell",
                 &args,
                 Some("Workflow: installing dependency"),
@@ -533,7 +576,7 @@ impl DagExecutor {
         );
 
         let tools: Vec<Box<dyn Tool>> =
-            vec![Box::new(CurrentTimeTool), Box::new(ShellTool::new())];
+            vec![Box::new(CurrentTimeTool), Box::new(self.make_shell_tool())];
         let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
         let mut messages = vec![
@@ -796,7 +839,7 @@ impl DagExecutor {
         for tool_name in &node.tools {
             match tool_name.as_str() {
                 "execute_shell" => {
-                    tools.push(Box::new(ShellTool::new()));
+                    tools.push(Box::new(self.make_shell_tool()));
                 }
                 "web_search" => {
                     if let Some(t) = WebSearchTool::new() {
@@ -1219,5 +1262,51 @@ mod tests {
         assert_eq!(trace.status, "completed");
         assert!(trace.duration_ms >= 40, "Expected ≥40ms, got {}ms", trace.duration_ms);
         assert_eq!(trace.iterations, 1);
+    }
+
+    #[tokio::test]
+    async fn panicked_node_produces_failed_result() {
+        struct PanickingProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for PanickingProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> Result<LlmResponse, LlmError> {
+                panic!("intentional test panic");
+            }
+        }
+
+        let plan = WorkflowPlan {
+            nodes: vec![
+                make_node("a", NodeKind::Research),
+                make_node("b", NodeKind::Synthesis),
+            ],
+            edges: vec![PlanEdge {
+                from: "a".into(),
+                to: "b".into(),
+                kind: EdgeKind::Data,
+            }],
+        };
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(PanickingProvider);
+        let exec = make_executor(provider);
+        let dag = WorkflowDag::from_plan(plan).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let dag_result = exec.execute(dag, tx).await.unwrap();
+
+        assert_eq!(dag_result.results.len(), 2);
+        assert!(matches!(
+            dag_result.results[0].1.status,
+            NodeStatus::Failed(_)
+        ));
+        assert!(matches!(
+            dag_result.results[1].1.status,
+            NodeStatus::Skipped
+        ));
+        assert_eq!(dag_result.node_traces.len(), 2);
     }
 }

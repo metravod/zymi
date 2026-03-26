@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::{Event, EventStoreError};
@@ -38,6 +39,10 @@ pub trait EventStore: Send + Sync {
         stream_id: &str,
         kind_tag: Option<&str>,
     ) -> Result<u64, EventStoreError>;
+
+    /// Verify the hash chain for a stream. Returns Ok(count) if all hashes are valid,
+    /// or an error describing the first broken link.
+    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError>;
 
     /// Find "orphaned" inbound events: events of `inbound_tag` whose correlation_id
     /// has no corresponding event of `completion_tag` in the store.
@@ -87,6 +92,21 @@ impl SqliteEventStore {
         )
         .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
+        // Migration: add hash chain columns if they don't exist yet
+        let has_hash: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'hash'")
+            .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_hash {
+            conn.execute_batch(
+                "ALTER TABLE events ADD COLUMN prev_hash TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE events ADD COLUMN hash TEXT NOT NULL DEFAULT '';",
+            )
+            .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -96,6 +116,15 @@ impl SqliteEventStore {
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
+}
+
+/// Compute SHA-256(event_id || data || prev_hash) as hex string.
+fn compute_hash(event_id: &str, data: &str, prev_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event_id.as_bytes());
+    hasher.update(data.as_bytes());
+    hasher.update(prev_hash.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[async_trait]
@@ -123,9 +152,22 @@ impl EventStore for SqliteEventStore {
                 .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
+            // Hash chain: get previous hash in this stream
+            let prev_hash: String = conn
+                .prepare(
+                    "SELECT COALESCE(
+                        (SELECT hash FROM events WHERE stream_id = ?1 ORDER BY sequence DESC LIMIT 1),
+                        ''
+                     )",
+                )
+                .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let hash = compute_hash(&event_id, &data, &prev_hash);
+
             conn.execute(
-                "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, correlation_id, causation_id, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, correlation_id, causation_id, source, prev_hash, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     event_id,
                     stream_id,
@@ -136,6 +178,8 @@ impl EventStore for SqliteEventStore {
                     correlation_id,
                     causation_id,
                     source,
+                    prev_hash,
+                    hash,
                 ],
             )
             .map_err(|e| EventStoreError::Connection(e.to_string()))?;
@@ -259,6 +303,62 @@ impl EventStore for SqliteEventStore {
                     .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
                     .map_err(|e| EventStoreError::Connection(e.to_string()))?,
             };
+            Ok(count)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError> {
+        let conn = self.conn.clone();
+        let stream_id = stream_id.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_id, data, prev_hash, hash FROM events
+                     WHERE stream_id = ?1 ORDER BY sequence ASC",
+                )
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let rows = stmt
+                .query_map([&stream_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let mut expected_prev_hash = String::new();
+            let mut count: u64 = 0;
+
+            for row in rows {
+                let (event_id, data, prev_hash, stored_hash) =
+                    row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+                if prev_hash != expected_prev_hash {
+                    return Err(EventStoreError::Connection(format!(
+                        "Hash chain broken at event {event_id}: prev_hash mismatch \
+                         (expected '{expected_prev_hash}', got '{prev_hash}')"
+                    )));
+                }
+
+                let computed = compute_hash(&event_id, &data, &prev_hash);
+                if computed != stored_hash {
+                    return Err(EventStoreError::Connection(format!(
+                        "Hash chain broken at event {event_id}: hash mismatch \
+                         (computed '{computed}', stored '{stored_hash}')"
+                    )));
+                }
+
+                expected_prev_hash = stored_hash;
+                count += 1;
+            }
+
             Ok(count)
         })
         .await
@@ -532,5 +632,68 @@ mod tests {
 
         let events = store.read_stream("s1", 1).await.unwrap();
         assert_eq!(events[0].correlation_id, Some(corr));
+    }
+
+    #[tokio::test]
+    async fn hash_chain_valid_after_appends() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s1",
+            EventKind::AgentProcessingCompleted {
+                conversation_id: "s1".into(),
+                success: true,
+            },
+        );
+        let mut e3 = make_event(
+            "s1",
+            EventKind::ResponseReady {
+                conversation_id: "s1".into(),
+                content: "done".into(),
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+        store.append(&mut e3).await.unwrap();
+
+        let count = store.verify_chain("s1").await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn hash_chain_empty_stream_is_valid() {
+        let (_dir, store) = setup().await;
+        let count = store.verify_chain("nonexistent").await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn hash_chain_per_stream_independent() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+
+        // Both streams should independently verify
+        assert_eq!(store.verify_chain("s1").await.unwrap(), 1);
+        assert_eq!(store.verify_chain("s2").await.unwrap(), 1);
     }
 }

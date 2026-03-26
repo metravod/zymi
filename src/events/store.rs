@@ -1,0 +1,480 @@
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use rusqlite::Connection;
+use tokio::sync::Mutex;
+
+use super::{Event, EventStoreError};
+
+/// Append-only event store. Events are immutable once written.
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    /// Append an event to its stream. Assigns the next sequence number.
+    /// Returns the assigned sequence number.
+    async fn append(&self, event: &mut Event) -> Result<u64, EventStoreError>;
+
+    /// Read all events in a stream starting from `from_seq` (inclusive).
+    async fn read_stream(
+        &self,
+        stream_id: &str,
+        from_seq: u64,
+    ) -> Result<Vec<Event>, EventStoreError>;
+
+    /// Read events across all streams, ordered by insertion (global sequence).
+    /// `from_global_seq` is the `id` (autoincrement) lower bound (exclusive).
+    async fn read_all(
+        &self,
+        from_global_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventStoreError>;
+
+    /// Get the last sequence number for a stream, or 0 if empty.
+    async fn last_sequence(&self, stream_id: &str) -> Result<u64, EventStoreError>;
+
+    /// Count events in a stream, optionally filtered by kind tag.
+    async fn count(
+        &self,
+        stream_id: &str,
+        kind_tag: Option<&str>,
+    ) -> Result<u64, EventStoreError>;
+}
+
+/// SQLite-backed event store. Uses the same DB file as ConversationStorage.
+pub struct SqliteEventStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteEventStore {
+    pub fn new(path: &Path) -> Result<Self, EventStoreError> {
+        let conn =
+            Connection::open(path).map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL UNIQUE,
+                 stream_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 timestamp TEXT NOT NULL,
+                 kind_tag TEXT NOT NULL,
+                 data TEXT NOT NULL,
+                 correlation_id TEXT,
+                 causation_id TEXT,
+                 source TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_stream_seq
+                 ON events(stream_id, sequence);
+             CREATE INDEX IF NOT EXISTS idx_events_correlation
+                 ON events(correlation_id);
+             CREATE INDEX IF NOT EXISTS idx_events_kind
+                 ON events(kind_tag);",
+        )
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Create from an existing shared connection. Caller must ensure the events table exists.
+    pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+}
+
+#[async_trait]
+impl EventStore for SqliteEventStore {
+    async fn append(&self, event: &mut Event) -> Result<u64, EventStoreError> {
+        let conn = self.conn.clone();
+        let event_id = event.id.to_string();
+        let stream_id = event.stream_id.clone();
+        let timestamp = event.timestamp.to_rfc3339();
+        let kind_tag = event.kind_tag().to_string();
+        let data = serde_json::to_string(&event)
+            .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+        let correlation_id = event.correlation_id.map(|u| u.to_string());
+        let causation_id = event.causation_id.map(|u| u.to_string());
+        let source = event.source.clone();
+
+        let seq = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            // Assign next sequence in this stream
+            let next_seq: u64 = conn
+                .prepare(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE stream_id = ?1",
+                )
+                .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            conn.execute(
+                "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, correlation_id, causation_id, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    event_id,
+                    stream_id,
+                    next_seq,
+                    timestamp,
+                    kind_tag,
+                    data,
+                    correlation_id,
+                    causation_id,
+                    source,
+                ],
+            )
+            .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            Ok::<u64, EventStoreError>(next_seq)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))??;
+
+        event.sequence = seq;
+        Ok(seq)
+    }
+
+    async fn read_stream(
+        &self,
+        stream_id: &str,
+        from_seq: u64,
+    ) -> Result<Vec<Event>, EventStoreError> {
+        let conn = self.conn.clone();
+        let stream_id = stream_id.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT data FROM events WHERE stream_id = ?1 AND sequence >= ?2 ORDER BY sequence ASC",
+                )
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![stream_id, from_seq], |row| {
+                    let data: String = row.get(0)?;
+                    Ok(data)
+                })
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let data = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+                let event: Event = serde_json::from_str(&data)
+                    .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+                events.push(event);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn read_all(
+        &self,
+        from_global_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventStoreError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT data FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                )
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![from_global_seq, limit], |row| {
+                    let data: String = row.get(0)?;
+                    Ok(data)
+                })
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let data = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+                let event: Event = serde_json::from_str(&data)
+                    .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+                events.push(event);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn last_sequence(&self, stream_id: &str) -> Result<u64, EventStoreError> {
+        let conn = self.conn.clone();
+        let stream_id = stream_id.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let seq: u64 = conn
+                .prepare("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE stream_id = ?1")
+                .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+            Ok(seq)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn count(
+        &self,
+        stream_id: &str,
+        kind_tag: Option<&str>,
+    ) -> Result<u64, EventStoreError> {
+        let conn = self.conn.clone();
+        let stream_id = stream_id.to_owned();
+        let kind_tag = kind_tag.map(|s| s.to_owned());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let count: u64 = match kind_tag {
+                Some(tag) => conn
+                    .prepare(
+                        "SELECT COUNT(*) FROM events WHERE stream_id = ?1 AND kind_tag = ?2",
+                    )
+                    .and_then(|mut s| s.query_row(rusqlite::params![stream_id, tag], |row| row.get(0)))
+                    .map_err(|e| EventStoreError::Connection(e.to_string()))?,
+                None => conn
+                    .prepare("SELECT COUNT(*) FROM events WHERE stream_id = ?1")
+                    .and_then(|mut s| s.query_row([&stream_id], |row| row.get(0)))
+                    .map_err(|e| EventStoreError::Connection(e.to_string()))?,
+            };
+            Ok(count)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Message;
+    use crate::events::EventKind;
+    use tempfile::TempDir;
+
+    async fn setup() -> (TempDir, SqliteEventStore) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_events.db");
+        let store = SqliteEventStore::new(&db_path).unwrap();
+        (dir, store)
+    }
+
+    fn make_event(stream: &str, kind: EventKind) -> Event {
+        Event::new(stream.into(), kind, "test".into())
+    }
+
+    #[tokio::test]
+    async fn append_assigns_sequence() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s1",
+            EventKind::AgentProcessingCompleted {
+                conversation_id: "s1".into(),
+                success: true,
+            },
+        );
+
+        let seq1 = store.append(&mut e1).await.unwrap();
+        let seq2 = store.append(&mut e2).await.unwrap();
+
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(e1.sequence, 1);
+        assert_eq!(e2.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn sequences_are_per_stream() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+
+        let seq1 = store.append(&mut e1).await.unwrap();
+        let seq2 = store.append(&mut e2).await.unwrap();
+
+        // Each stream starts at 1
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 1);
+    }
+
+    #[tokio::test]
+    async fn read_stream_returns_ordered_events() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::UserMessageReceived {
+                content: Message::User("hello".into()),
+                connector: "test".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s1",
+            EventKind::ResponseReady {
+                conversation_id: "s1".into(),
+                content: "world".into(),
+            },
+        );
+        // Different stream
+        let mut e3 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+        store.append(&mut e3).await.unwrap();
+
+        let events = store.read_stream("s1", 1).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind_tag(), "user_message_received");
+        assert_eq!(events[1].kind_tag(), "response_ready");
+
+        // from_seq filters
+        let events = store.read_stream("s1", 2).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind_tag(), "response_ready");
+
+        // Different stream
+        let events = store.read_stream("s2", 1).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_all_returns_global_order() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+        let mut e3 = make_event(
+            "s1",
+            EventKind::AgentProcessingCompleted {
+                conversation_id: "s1".into(),
+                success: true,
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+        store.append(&mut e3).await.unwrap();
+
+        let all = store.read_all(0, 100).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // from_global_seq filters (autoincrement ids: 1, 2, 3)
+        let after_first = store.read_all(1, 100).await.unwrap();
+        assert_eq!(after_first.len(), 2);
+
+        // limit works
+        let limited = store.read_all(0, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn last_sequence_empty_stream() {
+        let (_dir, store) = setup().await;
+        let seq = store.last_sequence("nonexistent").await.unwrap();
+        assert_eq!(seq, 0);
+    }
+
+    #[tokio::test]
+    async fn count_with_kind_filter() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::ToolCallRequested {
+                tool_name: "shell".into(),
+                arguments: "ls".into(),
+                call_id: "tc-1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s1",
+            EventKind::ToolCallCompleted {
+                call_id: "tc-1".into(),
+                result_preview: "ok".into(),
+                is_error: false,
+                duration_ms: 10,
+            },
+        );
+        let mut e3 = make_event(
+            "s1",
+            EventKind::ToolCallRequested {
+                tool_name: "web_search".into(),
+                arguments: "rust".into(),
+                call_id: "tc-2".into(),
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+        store.append(&mut e3).await.unwrap();
+
+        let total = store.count("s1", None).await.unwrap();
+        assert_eq!(total, 3);
+
+        let requested = store.count("s1", Some("tool_call_requested")).await.unwrap();
+        assert_eq!(requested, 2);
+
+        let completed = store.count("s1", Some("tool_call_completed")).await.unwrap();
+        assert_eq!(completed, 1);
+    }
+
+    #[tokio::test]
+    async fn correlation_id_preserved() {
+        let (_dir, store) = setup().await;
+        let corr = uuid::Uuid::new_v4();
+        let mut event = Event::new(
+            "s1".into(),
+            EventKind::UserMessageReceived {
+                content: Message::User("test".into()),
+                connector: "telegram".into(),
+            },
+            "telegram".into(),
+        )
+        .with_correlation(corr);
+
+        store.append(&mut event).await.unwrap();
+
+        let events = store.read_stream("s1", 1).await.unwrap();
+        assert_eq!(events[0].correlation_id, Some(corr));
+    }
+}

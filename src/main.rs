@@ -4,6 +4,7 @@ mod connectors;
 mod core;
 mod daemon;
 mod eval;
+mod events;
 mod git_sync;
 mod mcp;
 mod policy;

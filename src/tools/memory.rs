@@ -167,6 +167,13 @@ impl Tool for WriteMemoryTool {
         }
     }
 
+    fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
+        let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let key = args.get("filename")?.as_str()?.to_string();
+        let content = args.get("content")?.as_str()?.to_string();
+        Some(crate::esaa::Intention::WriteMemory { key, content })
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String, String> {
         let args: serde_json::Value =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;

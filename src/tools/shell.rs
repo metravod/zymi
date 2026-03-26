@@ -252,6 +252,16 @@ impl Tool for ShellTool {
         format!("Command:\n<code>{}</code>", command)
     }
 
+    fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
+        let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let command = args["command"].as_str()?;
+        let timeout_secs = args["timeout_secs"].as_u64();
+        Some(crate::esaa::Intention::ExecuteShellCommand {
+            command: command.to_string(),
+            timeout_secs,
+        })
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String, String> {
         let args: serde_json::Value =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;

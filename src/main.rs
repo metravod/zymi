@@ -282,6 +282,7 @@ struct App {
     policy_engine: Arc<policy::PolicyEngine>,
     audit_log: audit::AuditLog,
     sandbox: Arc<sandbox::SandboxManager>,
+    event_bus: Arc<events::bus::EventBus>,
 }
 
 async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
@@ -297,6 +298,13 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         SqliteStorage::new(&db_path)
             .with_context(|| format!("Failed to open SQLite database: {}", db_path.display()))?,
     );
+
+    // Event store + bus (EDA foundation)
+    let event_store = Arc::new(
+        events::store::SqliteEventStore::new(&db_path)
+            .with_context(|| "Failed to initialize event store")?,
+    );
+    let event_bus = Arc::new(events::bus::EventBus::new(event_store));
 
     let agent_prompt_path = memory_dir.join("AGENT.md");
     let system_prompt = std::fs::read_to_string(&agent_prompt_path).unwrap_or_else(|e| {
@@ -510,6 +518,7 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         policy_engine,
         audit_log,
         sandbox: sandbox_manager,
+        event_bus,
     })
 }
 
@@ -649,6 +658,14 @@ async fn main() -> Result<()> {
     if let Some(ref lf) = app.langfuse {
         bg_handles.push(lf.start_flushing(app.shutdown.clone()));
     }
+
+    // Agent worker: consumes inbound events, drives agent, publishes responses
+    let agent_worker = Arc::new(events::agent_worker::AgentWorker::new(
+        app.agent.clone(),
+        app.event_bus.clone(),
+        app.shared_approval_handler.clone(),
+    ));
+    bg_handles.push(tokio::spawn(async move { agent_worker.run().await }));
 
     // Destructure what we need before moving into connector
     let shutdown = app.shutdown.clone();

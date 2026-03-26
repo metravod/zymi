@@ -3,21 +3,25 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::agent::Agent;
-use crate::core::approval::ApprovalHandler;
+use crate::core::approval::SharedApprovalHandler;
 
 use super::bus::EventBus;
 use super::{Event, EventKind};
 
 /// Consumes inbound events (UserMessageReceived, ScheduledTaskTriggered) and drives
 /// the agent to produce a response. Publishes ResponseReady when done.
+///
+/// The `shared_approval` slot is set by connectors before they publish events.
+/// The worker reads from it during processing, so approval flows work transparently.
 pub struct AgentWorker {
     agent: Arc<Agent>,
     bus: Arc<EventBus>,
+    shared_approval: SharedApprovalHandler,
 }
 
 impl AgentWorker {
-    pub fn new(agent: Arc<Agent>, bus: Arc<EventBus>) -> Self {
-        Self { agent, bus }
+    pub fn new(agent: Arc<Agent>, bus: Arc<EventBus>, shared_approval: SharedApprovalHandler) -> Self {
+        Self { agent, bus, shared_approval }
     }
 
     /// Run the worker loop. First recovers orphaned events from a prior crash,
@@ -94,18 +98,28 @@ impl AgentWorker {
             return;
         }
 
+        // Read the shared approval handler — set by the connector that published this event.
+        // For scheduled tasks there may be no handler (approval goes to Telegram if configured).
+        let approval_handler = self.shared_approval.read().await.clone();
+
         let result = match &event.kind {
             EventKind::UserMessageReceived { content, .. } => {
-                self.process_user_message(&stream_id, content.clone(), None)
+                self.agent
+                    .process_multimodal(
+                        &stream_id,
+                        content.clone(),
+                        approval_handler.as_deref(),
+                    )
                     .await
             }
             EventKind::ScheduledTaskTriggered { task, .. } => {
-                self.process_user_message(
-                    &stream_id,
-                    crate::core::Message::User(task.clone()),
-                    None,
-                )
-                .await
+                self.agent
+                    .process_multimodal(
+                        &stream_id,
+                        crate::core::Message::User(task.clone()),
+                        approval_handler.as_deref(),
+                    )
+                    .await
             }
             _ => return,
         };
@@ -151,16 +165,6 @@ impl AgentWorker {
         }
     }
 
-    async fn process_user_message(
-        &self,
-        conversation_id: &str,
-        message: crate::core::Message,
-        approval_handler: Option<&dyn ApprovalHandler>,
-    ) -> Result<String, crate::core::LlmError> {
-        self.agent
-            .process_multimodal(conversation_id, message, approval_handler)
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -180,7 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_inbound_publishes_lifecycle_events() {
+    async fn event_envelope_structure() {
         let (_dir, bus) = setup_bus().await;
         let mut rx = bus.subscribe().await;
 
@@ -195,10 +199,8 @@ mod tests {
         )
         .with_correlation(correlation);
 
-        // Publish the inbound event directly (simulating what a connector does)
         bus.publish(event).await.unwrap();
 
-        // The subscriber should receive UserMessageReceived
         let received = rx.recv().await.unwrap();
         assert_eq!(received.kind_tag(), "user_message_received");
         assert_eq!(received.correlation_id, Some(correlation));

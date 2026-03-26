@@ -1,5 +1,6 @@
 pub mod agent_worker;
 pub mod bus;
+pub mod connector;
 pub mod store;
 
 use chrono::{DateTime, Utc};

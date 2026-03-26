@@ -669,6 +669,13 @@ async fn main() -> Result<()> {
     ));
     bg_handles.push(tokio::spawn(async move { agent_worker.run().await }));
 
+    // Audit projection: subscribes to event bus, writes audit log entries
+    let audit_projection = audit::AuditProjection::new(
+        app.event_bus.clone(),
+        app.audit_log.clone(),
+    );
+    bg_handles.push(tokio::spawn(audit_projection.run()));
+
     // Destructure what we need before moving into connector
     let shutdown = app.shutdown.clone();
     let git_sync = app.git_sync.clone();

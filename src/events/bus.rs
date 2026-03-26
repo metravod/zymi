@@ -5,10 +5,19 @@ use tokio::sync::{mpsc, RwLock};
 use super::store::EventStore;
 use super::{Event, EventStoreError};
 
+/// Default capacity for subscriber channels. Provides backpressure:
+/// if a subscriber falls behind by this many events, new sends will fail
+/// (the event is still persisted in the store — subscriber can replay later).
+const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+
 /// In-process event bus. Persists events to the store, then fans out to subscribers.
+///
+/// Backpressure: subscriber channels are bounded. If a subscriber's buffer is full,
+/// the event is dropped for that subscriber (but always persisted in the store).
+/// Subscribers that fall behind can recover by replaying from the store.
 pub struct EventBus {
     store: Arc<dyn EventStore>,
-    subscribers: RwLock<Vec<mpsc::UnboundedSender<Event>>>,
+    subscribers: RwLock<Vec<mpsc::Sender<Event>>>,
 }
 
 impl EventBus {
@@ -21,21 +30,32 @@ impl EventBus {
 
     /// Persist the event to the store (source of truth), then deliver to all subscribers.
     /// The event's sequence number is assigned by the store.
+    ///
+    /// Events are always persisted even if no subscriber is available or all buffers are full.
     pub async fn publish(&self, mut event: Event) -> Result<(), EventStoreError> {
         self.store.append(&mut event).await?;
 
         let subs = self.subscribers.read().await;
-        // Remove closed channels lazily on next subscribe/publish
         for tx in subs.iter() {
-            // Ignore send errors -- subscriber may have dropped
-            let _ = tx.send(event.clone());
+            // try_send: non-blocking, drops the event for this subscriber if buffer is full.
+            // The event is still in the store — subscriber can replay if needed.
+            let _ = tx.try_send(event.clone());
         }
         Ok(())
     }
 
-    /// Subscribe to all events. Returns a receiver that gets a copy of every published event.
-    pub async fn subscribe(&self) -> mpsc::UnboundedReceiver<Event> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Subscribe to all events. Returns a bounded receiver.
+    ///
+    /// If the subscriber falls behind by more than `DEFAULT_CHANNEL_CAPACITY` events,
+    /// newer events will be dropped for this subscriber. The subscriber can recover
+    /// by reading from the store directly.
+    pub async fn subscribe(&self) -> mpsc::Receiver<Event> {
+        self.subscribe_with_capacity(DEFAULT_CHANNEL_CAPACITY).await
+    }
+
+    /// Subscribe with a custom channel capacity.
+    pub async fn subscribe_with_capacity(&self, capacity: usize) -> mpsc::Receiver<Event> {
+        let (tx, rx) = mpsc::channel(capacity);
         let mut subs = self.subscribers.write().await;
         // Clean up dead subscribers while we have the write lock
         subs.retain(|tx| !tx.is_closed());
@@ -178,5 +198,30 @@ mod tests {
             }
             assert_eq!(received.sequence, (i + 1) as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn backpressure_drops_events_for_slow_subscriber() {
+        let (_dir, bus) = setup().await;
+        // Small capacity to test backpressure
+        let mut rx = bus.subscribe_with_capacity(2).await;
+
+        // Publish 5 events — only first 2 should fit in the channel
+        for i in 0..5 {
+            let event = Event::new(
+                "s1".into(),
+                EventKind::LlmCallStarted { iteration: i },
+                "agent".into(),
+            );
+            bus.publish(event).await.unwrap();
+        }
+
+        // Subscriber gets first 2
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        // 3rd would have been dropped due to full buffer
+        // But all 5 are in the store
+        let stored = bus.store().read_stream("s1", 1).await.unwrap();
+        assert_eq!(stored.len(), 5);
     }
 }

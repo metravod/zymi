@@ -20,9 +20,14 @@ impl AgentWorker {
         Self { agent, bus }
     }
 
-    /// Run the worker loop. Spawns a tokio task per inbound event.
-    /// Call this from a `tokio::spawn`.
+    /// Run the worker loop. First recovers orphaned events from a prior crash,
+    /// then subscribes and processes new events. Call from `tokio::spawn`.
     pub async fn run(self: Arc<Self>) {
+        // Recovery: find UserMessageReceived events that never got a ResponseReady
+        if let Err(e) = self.recover_orphaned().await {
+            log::error!("AgentWorker recovery scan failed: {e}");
+        }
+
         let mut rx = self.bus.subscribe().await;
 
         while let Some(event) = rx.recv().await {
@@ -38,6 +43,33 @@ impl AgentWorker {
                 _ => {} // Other events handled by other workers
             }
         }
+    }
+
+    /// Scan the event store for inbound events that were never completed.
+    /// This handles the case where zymi crashed mid-processing.
+    async fn recover_orphaned(&self) -> Result<(), super::EventStoreError> {
+        let orphaned = self
+            .bus
+            .store()
+            .find_unmatched("user_message_received", "response_ready")
+            .await?;
+
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        log::info!(
+            "AgentWorker: recovering {} orphaned event(s) from prior run",
+            orphaned.len()
+        );
+
+        for event in orphaned {
+            let worker_self = self;
+            // Process sequentially to avoid overwhelming the agent on restart
+            worker_self.handle_inbound(event).await;
+        }
+
+        Ok(())
     }
 
     /// Run a single event through the agent and publish the result.
@@ -149,13 +181,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_inbound_publishes_lifecycle_events() {
-        // We can't easily create a real Agent without all its dependencies,
-        // but we can test the event flow by checking that the worker publishes
-        // AgentProcessingStarted before attempting to call the agent.
-        //
-        // For a full integration test, we'd need a mock LlmProvider.
-        // This test verifies the event envelope structure.
-
         let (_dir, bus) = setup_bus().await;
         let mut rx = bus.subscribe().await;
 
@@ -177,5 +202,72 @@ mod tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received.kind_tag(), "user_message_received");
         assert_eq!(received.correlation_id, Some(correlation));
+    }
+
+    #[tokio::test]
+    async fn find_unmatched_detects_orphaned_events() {
+        let (_dir, bus) = setup_bus().await;
+
+        let corr1 = Uuid::new_v4();
+        let corr2 = Uuid::new_v4();
+        let corr3 = Uuid::new_v4();
+
+        // Event 1: has a matching ResponseReady (not orphaned)
+        let e1 = Event::new(
+            "s1".into(),
+            EventKind::UserMessageReceived {
+                content: Message::User("completed".into()),
+                connector: "test".into(),
+            },
+            "test".into(),
+        )
+        .with_correlation(corr1);
+        bus.publish(e1).await.unwrap();
+
+        let r1 = Event::new(
+            "s1".into(),
+            EventKind::ResponseReady {
+                conversation_id: "s1".into(),
+                content: "done".into(),
+            },
+            "agent_worker".into(),
+        )
+        .with_correlation(corr1);
+        bus.publish(r1).await.unwrap();
+
+        // Event 2: orphaned (no ResponseReady)
+        let e2 = Event::new(
+            "s2".into(),
+            EventKind::UserMessageReceived {
+                content: Message::User("crashed".into()),
+                connector: "test".into(),
+            },
+            "test".into(),
+        )
+        .with_correlation(corr2);
+        bus.publish(e2).await.unwrap();
+
+        // Event 3: also orphaned
+        let e3 = Event::new(
+            "s3".into(),
+            EventKind::UserMessageReceived {
+                content: Message::User("also crashed".into()),
+                connector: "test".into(),
+            },
+            "test".into(),
+        )
+        .with_correlation(corr3);
+        bus.publish(e3).await.unwrap();
+
+        // Query orphaned
+        let orphaned = bus
+            .store()
+            .find_unmatched("user_message_received", "response_ready")
+            .await
+            .unwrap();
+
+        assert_eq!(orphaned.len(), 2);
+        assert_eq!(orphaned[0].correlation_id, Some(corr2));
+        assert_eq!(orphaned[1].correlation_id, Some(corr3));
     }
 }

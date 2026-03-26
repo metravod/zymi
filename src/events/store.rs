@@ -38,6 +38,15 @@ pub trait EventStore: Send + Sync {
         stream_id: &str,
         kind_tag: Option<&str>,
     ) -> Result<u64, EventStoreError>;
+
+    /// Find "orphaned" inbound events: events of `inbound_tag` whose correlation_id
+    /// has no corresponding event of `completion_tag` in the store.
+    /// Used for recovery after restart.
+    async fn find_unmatched(
+        &self,
+        inbound_tag: &str,
+        completion_tag: &str,
+    ) -> Result<Vec<Event>, EventStoreError>;
 }
 
 /// SQLite-backed event store. Uses the same DB file as ConversationStorage.
@@ -251,6 +260,53 @@ impl EventStore for SqliteEventStore {
                     .map_err(|e| EventStoreError::Connection(e.to_string()))?,
             };
             Ok(count)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn find_unmatched(
+        &self,
+        inbound_tag: &str,
+        completion_tag: &str,
+    ) -> Result<Vec<Event>, EventStoreError> {
+        let conn = self.conn.clone();
+        let inbound_tag = inbound_tag.to_owned();
+        let completion_tag = completion_tag.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Find inbound events whose correlation_id has no matching completion event.
+            // Events without correlation_id are skipped (can't match).
+            let mut stmt = conn
+                .prepare(
+                    "SELECT i.data FROM events i
+                     WHERE i.kind_tag = ?1
+                       AND i.correlation_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM events c
+                           WHERE c.kind_tag = ?2
+                             AND c.correlation_id = i.correlation_id
+                       )
+                     ORDER BY i.id ASC",
+                )
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![inbound_tag, completion_tag], |row| {
+                    let data: String = row.get(0)?;
+                    Ok(data)
+                })
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let data = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+                let event: Event = serde_json::from_str(&data)
+                    .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+                events.push(event);
+            }
+            Ok(events)
         })
         .await
         .map_err(|e| EventStoreError::Connection(e.to_string()))?

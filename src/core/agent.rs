@@ -12,6 +12,8 @@ use crate::core::approval::ApprovalHandler;
 use crate::core::langfuse::{self, LangfuseClient, TraceCtx};
 use crate::core::tool_selector::ToolSelector;
 use crate::core::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
+use crate::events::bus::EventBus;
+use crate::events::{Event, EventKind};
 use crate::mcp::McpManager;
 use crate::storage::ConversationStorage;
 use crate::tools::Tool;
@@ -109,6 +111,7 @@ pub struct Agent {
     auto_extract: bool,
     last_extract_ms: AtomicI64,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl Agent {
@@ -135,6 +138,7 @@ impl Agent {
             auto_extract: false,
             last_extract_ms: AtomicI64::new(0),
             mcp_manager: None,
+            event_bus: None,
         }
     }
 
@@ -188,6 +192,11 @@ impl Agent {
         self
     }
 
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
+    }
+
     /// Register multiple tools at runtime in a single batch embedding call.
     pub async fn register_tools(&self, new_tools: Vec<Box<dyn Tool>>) {
         if new_tools.is_empty() {
@@ -212,6 +221,20 @@ impl Agent {
             }
         }
         log::info!("Registered {} tools at runtime: [{}]", names.len(), names.join(", "));
+    }
+
+    /// Emit an event to the event bus (fire-and-forget).
+    /// Uses spawn_blocking-safe publish; errors are logged but don't fail the agent.
+    fn emit_event(&self, stream_id: &str, kind: EventKind) {
+        if let Some(ref bus) = self.event_bus {
+            let bus = bus.clone();
+            let event = Event::new(stream_id.to_string(), kind, "agent".into());
+            tokio::spawn(async move {
+                if let Err(e) = bus.publish(event).await {
+                    log::warn!("Failed to emit agent event: {e}");
+                }
+            });
+        }
     }
 
     /// Post-tool-call hook: trigger MCP hot-reload when manage_mcp adds a server.
@@ -594,8 +617,15 @@ impl Agent {
         let result = match tool_arc {
             Some(ref tool) => {
                 if tool.requires_approval_for(&tool_call.arguments) {
+                    let description = tool.format_approval_request(&tool_call.arguments);
+                    let approval_id = uuid::Uuid::new_v4().to_string();
+
+                    self.emit_event(&tool_call.id, EventKind::ApprovalRequested {
+                        description: description.clone(),
+                        approval_id: approval_id.clone(),
+                    });
+
                     let approved = if let Some(handler) = approval_handler {
-                        let description = tool.format_approval_request(&tool_call.arguments);
                         handler
                             .request_approval(&description, explanation)
                             .await
@@ -607,6 +637,11 @@ impl Agent {
                         );
                         false
                     };
+
+                    self.emit_event(&tool_call.id, EventKind::ApprovalDecided {
+                        approval_id,
+                        approved,
+                    });
 
                     if !approved {
                         "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
@@ -737,10 +772,17 @@ impl Agent {
         for iteration in 0..self.max_iterations {
             log::info!("Iteration {}/{}", iteration + 1, self.max_iterations);
 
+            self.emit_event(conversation_id, EventKind::LlmCallStarted { iteration });
+
             let llm_start = langfuse::timestamp();
             let response = self.chat_with_timeout(&messages, &tool_definitions).await?;
             let llm_end = langfuse::timestamp();
             self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
+
+            self.emit_event(conversation_id, EventKind::LlmCallCompleted {
+                has_tool_calls: !response.tool_calls.is_empty(),
+                usage: response.usage.clone(),
+            });
 
             if response.tool_calls.is_empty() {
                 let content = response.content.ok_or(LlmError::EmptyResponse)?;
@@ -791,6 +833,13 @@ impl Agent {
                     truncate_for_log(&tool_call.arguments, 200)
                 );
 
+                self.emit_event(conversation_id, EventKind::ToolCallRequested {
+                    tool_name: tool_call.name.clone(),
+                    arguments: truncate_for_log(&tool_call.arguments, 500),
+                    call_id: tool_call.id.clone(),
+                });
+
+                let tool_start_time = std::time::Instant::now();
                 let tool_start = langfuse::timestamp();
                 let (result, is_dup) = self
                     .execute_tool_call(
@@ -801,6 +850,14 @@ impl Agent {
                     )
                     .await?;
                 let tool_end = langfuse::timestamp();
+                let duration_ms = tool_start_time.elapsed().as_millis() as u64;
+
+                self.emit_event(conversation_id, EventKind::ToolCallCompleted {
+                    call_id: tool_call.id.clone(),
+                    result_preview: truncate_for_log(&result, 200),
+                    is_error: is_dup || result.starts_with("Tool error:") || result.starts_with("Unknown tool:"),
+                    duration_ms,
+                });
 
                 if let Some(ref t) = trace {
                     let is_error = is_dup
@@ -912,6 +969,8 @@ impl Agent {
             log::info!("Stream iteration {}/{}", iteration + 1, self.max_iterations);
             let _ = event_tx.send(StreamEvent::IterationStart(iteration));
 
+            self.emit_event(conversation_id, EventKind::LlmCallStarted { iteration });
+
             let max_reviews = self.monitor.as_ref().map_or(0, |m| m.max_reviews);
             let pending_review = monitor_reviews < max_reviews;
 
@@ -924,6 +983,11 @@ impl Agent {
             };
             let llm_end = langfuse::timestamp();
             self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
+
+            self.emit_event(conversation_id, EventKind::LlmCallCompleted {
+                has_tool_calls: !response.tool_calls.is_empty(),
+                usage: response.usage.clone(),
+            });
 
             if let Some(ref usage) = response.usage {
                 let _ = event_tx.send(StreamEvent::Usage {
@@ -986,12 +1050,19 @@ impl Agent {
                     truncate_for_log(&tool_call.arguments, 200)
                 );
 
+                self.emit_event(conversation_id, EventKind::ToolCallRequested {
+                    tool_name: tool_call.name.clone(),
+                    arguments: truncate_for_log(&tool_call.arguments, 500),
+                    call_id: tool_call.id.clone(),
+                });
+
                 let _ = event_tx.send(StreamEvent::ToolCallStart {
                     id: tool_call.id.clone(),
                     name: tool_call.name.clone(),
                     arguments: tool_call.arguments.clone(),
                 });
 
+                let tool_start_time = std::time::Instant::now();
                 let tool_start = langfuse::timestamp();
                 let (result, is_dup) = self
                     .execute_tool_call(
@@ -1002,10 +1073,18 @@ impl Agent {
                     )
                     .await?;
                 let tool_end = langfuse::timestamp();
+                let duration_ms = tool_start_time.elapsed().as_millis() as u64;
 
                 let is_error = is_dup
                     || result.starts_with("Tool error:")
                     || result.starts_with("Unknown tool:");
+
+                self.emit_event(conversation_id, EventKind::ToolCallCompleted {
+                    call_id: tool_call.id.clone(),
+                    result_preview: truncate_for_log(&result, 200),
+                    is_error,
+                    duration_ms,
+                });
 
                 if let Some(ref t) = trace {
                     t.record_tool(&tool_call.name, &tool_call.arguments, &result, is_error, &tool_start, &tool_end);

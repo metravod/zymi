@@ -497,6 +497,8 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         agent_builder = agent_builder.with_langfuse(lf.clone(), default_model_id);
     }
 
+    agent_builder = agent_builder.with_event_bus(event_bus.clone());
+
     let agent = Arc::new(agent_builder);
 
     let shutdown = tokio_util::sync::CancellationToken::new();

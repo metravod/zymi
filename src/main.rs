@@ -3,6 +3,7 @@ mod auth;
 mod connectors;
 mod core;
 mod daemon;
+mod esaa;
 mod eval;
 mod events;
 mod git_sync;

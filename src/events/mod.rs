@@ -115,6 +115,16 @@ pub enum EventKind {
         duration_ms: u64,
     },
 
+    // -- ESAA intention lifecycle --
+    IntentionEmitted {
+        intention_tag: String,
+        intention_data: String,
+    },
+    IntentionEvaluated {
+        intention_tag: String,
+        verdict: String,
+    },
+
     // -- Outbound --
     ResponseReady {
         conversation_id: String,
@@ -153,6 +163,8 @@ impl EventKind {
             EventKind::ApprovalRequested { .. } => "approval_requested",
             EventKind::ApprovalDecided { .. } => "approval_decided",
             EventKind::ToolCallCompleted { .. } => "tool_call_completed",
+            EventKind::IntentionEmitted { .. } => "intention_emitted",
+            EventKind::IntentionEvaluated { .. } => "intention_evaluated",
             EventKind::ResponseReady { .. } => "response_ready",
             EventKind::WorkflowStarted { .. } => "workflow_started",
             EventKind::WorkflowNodeStarted { .. } => "workflow_node_started",

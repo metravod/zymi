@@ -1,4 +1,5 @@
 pub mod contracts;
+pub mod orchestrator;
 
 use serde::{Deserialize, Serialize};
 

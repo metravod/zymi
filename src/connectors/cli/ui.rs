@@ -9,14 +9,38 @@ use super::markdown::render_markdown;
 use super::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let terminal_width = f.area().width;
+    let full_area = f.area();
+    let terminal_width = full_area.width;
+
+    // Outer frame wrapping everything
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Span::styled(
+            " zymi ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner_area = outer_block.inner(full_area);
+    f.render_widget(outer_block, full_area);
+
+    // Split: main content area + hint bar at bottom
+    let outer_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(inner_area);
+
+    let content_area = outer_chunks[0];
+    let hint_area = outer_chunks[1];
 
     // Auto-collapse panels on narrow terminals
     let show_left = app.left_panel_visible && terminal_width >= 100;
     let show_right = app.right_panel_visible && terminal_width >= 100;
 
     let left_width: u16 = if show_left { 28 } else { 0 };
-    let right_width: u16 = if show_right { 36 } else { 0 };
+    let right_width: u16 = if show_right { 44 } else { 0 };
 
     // Build horizontal constraints
     let mut h_constraints = Vec::new();
@@ -31,7 +55,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(h_constraints)
-        .split(f.area());
+        .split(content_area);
 
     let center_idx = if show_left { 1 } else { 0 };
 
@@ -48,6 +72,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let right_idx = h_chunks.len() - 1;
         draw_right_panel(f, app, h_chunks[right_idx]);
     }
+
+    // Hint bar at the very bottom, inside the outer frame
+    draw_hint_bar(f, app, hint_area);
 
     // Overlays (rendered on top of everything)
     if app.model_selector_open {
@@ -69,7 +96,6 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(5),    // chat area
         Constraint::Length(1), // status line
         Constraint::Length(input_height), // input
-        Constraint::Length(1), // hint bar
     ];
 
     let chunks = Layout::default()
@@ -81,7 +107,6 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
     draw_chat(f, app, chunks[1]);
     draw_status_line(f, app, chunks[2]);
     draw_input(f, app, chunks[3]);
-    draw_hint_bar(f, app, chunks[4]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
@@ -752,92 +777,107 @@ fn draw_add_model_form(f: &mut Frame, app: &App) {
 
 fn draw_left_panel(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.left_panel_focused;
-    let border_color = if focused { theme::ACCENT } else { theme::BORDER };
+    let dim = Style::default().fg(theme::SUBTEXT);
 
-    let block = Block::default()
+    // Split into 3 vertical blocks for Models, Files, SubAgents
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40), // Models
+            Constraint::Percentage(25), // System Files
+            Constraint::Percentage(35), // SubAgents
+        ])
+        .split(area);
+
+    // -- Models block --
+    let models_focused = focused && app.left_panel_section == LeftPanelSection::Models;
+    let models_border = if models_focused { theme::ACCENT } else { theme::BORDER };
+    let models_block = Block::default()
         .title(Span::styled(
-            " Sidebar ",
-            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            " Models ",
+            Style::default().fg(models_border).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(models_border));
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let models_inner = models_block.inner(chunks[0]);
+    f.render_widget(models_block, chunks[0]);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let dim = Style::default().fg(theme::SUBTEXT);
-    let section_style = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+    let mut model_lines: Vec<Line<'static>> = Vec::new();
+    for (i, model) in app.available_models.iter().enumerate() {
+        let is_current = model.id == app.current_model_id;
+        let is_selected = models_focused && i == app.left_panel_index;
+        let marker = if is_current { "* " } else { "  " };
 
-    // Models section
-    let models_active = app.left_panel_section == LeftPanelSection::Models;
-    let models_header = if models_active { "▸ Models" } else { "▹ Models" };
-    lines.push(Line::from(Span::styled(models_header, section_style)));
+        let style = if is_selected {
+            Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(theme::ACCENT)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
 
-    if models_active {
-        for (i, model) in app.available_models.iter().enumerate() {
-            let is_current = model.id == app.current_model_id;
-            let is_selected = focused && i == app.left_panel_index;
-            let marker = if is_current { "* " } else { "  " };
-
-            let style = if is_selected {
-                Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
-            } else if is_current {
-                Style::default().fg(theme::ACCENT)
-            } else {
-                Style::default().fg(theme::TEXT)
-            };
-
-            let name = truncate_str(&format!("{}{}", marker, model.name), inner.width as usize - 1);
-            lines.push(Line::from(Span::styled(name, style)));
-        }
+        let name = truncate_str(&format!("{}{}", marker, model.name), models_inner.width as usize);
+        model_lines.push(Line::from(Span::styled(name, style)));
     }
+    f.render_widget(Paragraph::new(model_lines), models_inner);
 
-    lines.push(Line::default());
+    // -- System Files block --
+    let sysfiles_focused = focused && app.left_panel_section == LeftPanelSection::SystemFiles;
+    let sysfiles_border = if sysfiles_focused { theme::ACCENT } else { theme::BORDER };
+    let sysfiles_block = Block::default()
+        .title(Span::styled(
+            " Files ",
+            Style::default().fg(sysfiles_border).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(sysfiles_border));
 
-    // System Files section
-    let sysfiles_active = app.left_panel_section == LeftPanelSection::SystemFiles;
-    let sysfiles_header = if sysfiles_active { "▸ System Files" } else { "▹ System Files" };
-    lines.push(Line::from(Span::styled(sysfiles_header, section_style)));
+    let sysfiles_inner = sysfiles_block.inner(chunks[1]);
+    f.render_widget(sysfiles_block, chunks[1]);
 
-    if sysfiles_active {
-        for (i, file) in app.system_files.iter().enumerate() {
-            let is_selected = focused && i == app.left_panel_index;
+    let mut file_lines: Vec<Line<'static>> = Vec::new();
+    for (i, file) in app.system_files.iter().enumerate() {
+        let is_selected = sysfiles_focused && i == app.left_panel_index;
+        let style = if is_selected {
+            Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            dim
+        };
+        file_lines.push(Line::from(Span::styled(format!(" {file}"), style)));
+    }
+    f.render_widget(Paragraph::new(file_lines), sysfiles_inner);
+
+    // -- SubAgents block --
+    let subagents_focused = focused && app.left_panel_section == LeftPanelSection::SubAgents;
+    let subagents_border = if subagents_focused { theme::ACCENT } else { theme::BORDER };
+    let subagents_block = Block::default()
+        .title(Span::styled(
+            " SubAgents ",
+            Style::default().fg(subagents_border).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(subagents_border));
+
+    let subagents_inner = subagents_block.inner(chunks[2]);
+    f.render_widget(subagents_block, chunks[2]);
+
+    let mut agent_lines: Vec<Line<'static>> = Vec::new();
+    if app.subagent_files.is_empty() {
+        agent_lines.push(Line::from(Span::styled(" (none)", dim)));
+    } else {
+        for (i, file) in app.subagent_files.iter().enumerate() {
+            let is_selected = subagents_focused && i == app.left_panel_index;
+            let name = file.trim_end_matches(".md");
             let style = if is_selected {
                 Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 dim
             };
-            lines.push(Line::from(Span::styled(format!("  {file}"), style)));
+            agent_lines.push(Line::from(Span::styled(format!(" {name}"), style)));
         }
     }
-
-    lines.push(Line::default());
-
-    // SubAgents section
-    let subagents_active = app.left_panel_section == LeftPanelSection::SubAgents;
-    let subagents_header = if subagents_active { "▸ SubAgents" } else { "▹ SubAgents" };
-    lines.push(Line::from(Span::styled(subagents_header, section_style)));
-
-    if subagents_active {
-        if app.subagent_files.is_empty() {
-            lines.push(Line::from(Span::styled("  (none)", dim)));
-        } else {
-            for (i, file) in app.subagent_files.iter().enumerate() {
-                let is_selected = focused && i == app.left_panel_index;
-                let name = file.trim_end_matches(".md");
-                let style = if is_selected {
-                    Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
-                } else {
-                    dim
-                };
-                lines.push(Line::from(Span::styled(format!("  {name}"), style)));
-            }
-        }
-    }
-
-    let panel = Paragraph::new(lines);
-    f.render_widget(panel, inner);
+    f.render_widget(Paragraph::new(agent_lines), subagents_inner);
 }
 
 fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -885,11 +925,15 @@ fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
         ]));
 
         if !entry.detail.is_empty() {
-            let detail = truncate_str(&entry.detail, inner.width.saturating_sub(4) as usize);
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(detail, dim),
-            ]));
+            // Show more detail text — allow up to 2 lines worth
+            let max_detail = inner.width.saturating_sub(3) as usize * 2;
+            let detail = truncate_str(&entry.detail, max_detail);
+            for detail_line in wrap_text(&detail, inner.width.saturating_sub(3) as usize) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(detail_line, dim),
+                ]));
+            }
         }
     }
 
@@ -908,11 +952,11 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let hints = if app.left_panel_focused {
         vec![
-            Span::styled(" F1", key_style), Span::styled(":Hide ", dim),
-            Span::styled("Tab", key_style), Span::styled(":Section ", dim),
-            Span::styled("Up/Dn", key_style), Span::styled(":Nav ", dim),
+            Span::styled(" \u{2191}\u{2193}", key_style), Span::styled(":Section ", dim),
+            Span::styled("Tab", key_style), Span::styled(":Item ", dim),
             Span::styled("Enter", key_style), Span::styled(":Select ", dim),
-            Span::styled("Esc", key_style), Span::styled(":Back", dim),
+            Span::styled("\u{2192}", key_style), Span::styled(":Chat ", dim),
+            Span::styled("F1", key_style), Span::styled(":Hide ", dim),
         ]
     } else {
         let mut h = vec![
@@ -926,6 +970,11 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         ]);
         if app.right_panel_visible {
             h.push(Span::styled("*", Style::default().fg(theme::SUCCESS)));
+        }
+        if app.left_panel_visible {
+            h.extend([
+                Span::styled(" \u{2190}", key_style), Span::styled(":Sidebar ", dim),
+            ]);
         }
         h.extend([
             Span::styled(" ^M", key_style), Span::styled(":Model ", dim),
@@ -947,4 +996,26 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let end = s.floor_char_boundary(max_len);
         format!("{}...", &s[..end])
     }
+}
+
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 || s.is_empty() {
+        return vec![s.to_string()];
+    }
+    let mut result = Vec::new();
+    let mut remaining = s;
+    while remaining.len() > width {
+        let boundary = remaining.floor_char_boundary(width);
+        // Try to break at a space
+        let break_at = remaining[..boundary]
+            .rfind(' ')
+            .map(|i| i + 1)
+            .unwrap_or(boundary);
+        result.push(remaining[..break_at].to_string());
+        remaining = &remaining[break_at..];
+    }
+    if !remaining.is_empty() {
+        result.push(remaining.to_string());
+    }
+    result
 }

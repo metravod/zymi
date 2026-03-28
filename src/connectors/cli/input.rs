@@ -132,28 +132,39 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     // Left panel navigation when focused
     if app.left_panel_focused && app.left_panel_visible {
         return match key.code {
+            // Up/Down switches between sections (Models / Files / SubAgents)
             KeyCode::Up => {
-                if app.left_panel_index > 0 {
-                    app.left_panel_index -= 1;
-                }
+                app.left_panel_section = app.left_panel_section.prev();
+                app.left_panel_index = 0;
                 InputAction::None
             }
             KeyCode::Down => {
-                let max = app.left_panel_section_len().saturating_sub(1);
-                if app.left_panel_index < max {
-                    app.left_panel_index += 1;
-                }
-                InputAction::None
-            }
-            KeyCode::Tab => {
-                // Cycle section
                 app.left_panel_section = app.left_panel_section.next();
                 app.left_panel_index = 0;
                 InputAction::None
             }
+            // Tab/BackTab navigates items within the current section
+            KeyCode::Tab => {
+                let max = app.left_panel_section_len().saturating_sub(1);
+                if app.left_panel_index < max {
+                    app.left_panel_index += 1;
+                } else {
+                    app.left_panel_index = 0;
+                }
+                InputAction::None
+            }
             KeyCode::BackTab => {
-                app.left_panel_section = app.left_panel_section.prev();
-                app.left_panel_index = 0;
+                if app.left_panel_index > 0 {
+                    app.left_panel_index -= 1;
+                } else {
+                    let max = app.left_panel_section_len().saturating_sub(1);
+                    app.left_panel_index = max;
+                }
+                InputAction::None
+            }
+            // Right arrow moves focus to chat
+            KeyCode::Right => {
+                app.left_panel_focused = false;
                 InputAction::None
             }
             KeyCode::Enter => {
@@ -185,6 +196,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     }
 
     match key.code {
+        // Left arrow: focus left panel (if visible)
+        KeyCode::Left if app.left_panel_visible && !app.left_panel_focused && key.modifiers.is_empty() => {
+            app.left_panel_focused = true;
+            InputAction::None
+        }
         // F1 toggles left panel
         KeyCode::F(1) => {
             app.left_panel_visible = !app.left_panel_visible;

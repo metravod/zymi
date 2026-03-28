@@ -1,7 +1,9 @@
+use std::path::PathBuf;
+
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use tui_textarea::{CursorMove, TextArea};
 
-use super::app::{AddModelForm, AddModelStep, App, PROVIDER_OPTIONS};
+use super::app::{AddModelForm, AddModelStep, App, LeftPanelSection, PROVIDER_OPTIONS};
 
 pub struct NewModelInfo {
     pub provider_index: usize,
@@ -16,6 +18,7 @@ pub enum InputAction {
     SendMessage(String),
     SwitchModel(String),
     AddModel(NewModelInfo),
+    OpenEditor(PathBuf),
     ToggleCopyMode,
     Quit,
     None,
@@ -126,7 +129,77 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         };
     }
 
+    // Left panel navigation when focused
+    if app.left_panel_focused && app.left_panel_visible {
+        return match key.code {
+            KeyCode::Up => {
+                if app.left_panel_index > 0 {
+                    app.left_panel_index -= 1;
+                }
+                InputAction::None
+            }
+            KeyCode::Down => {
+                let max = app.left_panel_section_len().saturating_sub(1);
+                if app.left_panel_index < max {
+                    app.left_panel_index += 1;
+                }
+                InputAction::None
+            }
+            KeyCode::Tab => {
+                // Cycle section
+                app.left_panel_section = app.left_panel_section.next();
+                app.left_panel_index = 0;
+                InputAction::None
+            }
+            KeyCode::BackTab => {
+                app.left_panel_section = app.left_panel_section.prev();
+                app.left_panel_index = 0;
+                InputAction::None
+            }
+            KeyCode::Enter => {
+                match app.left_panel_section {
+                    LeftPanelSection::Models => {
+                        if let Some(model) = app.available_models.get(app.left_panel_index) {
+                            let mid = model.id.clone();
+                            if mid != app.current_model_id {
+                                return InputAction::SwitchModel(mid);
+                            }
+                        }
+                        InputAction::None
+                    }
+                    LeftPanelSection::SystemFiles | LeftPanelSection::SubAgents => {
+                        if let Some(path) = app.left_panel_selected_path() {
+                            InputAction::OpenEditor(path)
+                        } else {
+                            InputAction::None
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::F(1) => {
+                app.left_panel_focused = false;
+                InputAction::None
+            }
+            _ => InputAction::None,
+        };
+    }
+
     match key.code {
+        // F1 toggles left panel
+        KeyCode::F(1) => {
+            app.left_panel_visible = !app.left_panel_visible;
+            if !app.left_panel_visible {
+                app.left_panel_focused = false;
+            } else {
+                app.left_panel_focused = true;
+            }
+            InputAction::None
+        }
+        // F2 toggles right panel
+        KeyCode::F(2) => {
+            app.right_panel_visible = !app.right_panel_visible;
+            InputAction::None
+        }
         // Ctrl+Y toggles copy mode (disables mouse capture for text selection)
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             InputAction::ToggleCopyMode

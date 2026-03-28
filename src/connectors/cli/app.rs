@@ -1,8 +1,12 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
+
 use tokio::sync::oneshot;
 use tui_textarea::TextArea;
 
 use crate::core::debug_provider::DebugEvent;
 use crate::core::StreamEvent;
+use crate::events::{Event, EventKind};
 
 pub const PROVIDER_OPTIONS: &[&str] = &["OpenAI Compatible", "Anthropic", "ChatGPT Plus (OAuth)"];
 
@@ -61,6 +65,48 @@ impl Default for UsageStats {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum LeftPanelSection {
+    Models,
+    SystemFiles,
+    SubAgents,
+}
+
+impl LeftPanelSection {
+    pub fn title(&self) -> &'static str {
+        match self {
+            LeftPanelSection::Models => "Models",
+            LeftPanelSection::SystemFiles => "System Files",
+            LeftPanelSection::SubAgents => "SubAgents",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            LeftPanelSection::Models => LeftPanelSection::SystemFiles,
+            LeftPanelSection::SystemFiles => LeftPanelSection::SubAgents,
+            LeftPanelSection::SubAgents => LeftPanelSection::Models,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            LeftPanelSection::Models => LeftPanelSection::SubAgents,
+            LeftPanelSection::SystemFiles => LeftPanelSection::Models,
+            LeftPanelSection::SubAgents => LeftPanelSection::SystemFiles,
+        }
+    }
+}
+
+pub struct ObservabilityEntry {
+    pub timestamp: String,
+    pub icon: &'static str,
+    pub kind: String,
+    pub detail: String,
+}
+
+const MAX_OBSERVABILITY_ENTRIES: usize = 500;
+
 pub struct App {
     pub messages: Vec<ChatEntry>,
     pub input: TextArea<'static>,
@@ -86,6 +132,17 @@ pub struct App {
     pub usage: UsageStats,
     pub input_price_per_1m: Option<f64>,
     pub output_price_per_1m: Option<f64>,
+    // -- Panel state --
+    pub left_panel_visible: bool,
+    pub right_panel_visible: bool,
+    pub left_panel_focused: bool,
+    pub left_panel_section: LeftPanelSection,
+    pub left_panel_index: usize,
+    pub right_panel_events: VecDeque<ObservabilityEntry>,
+    pub right_panel_scroll: u16,
+    pub system_files: Vec<String>,
+    pub subagent_files: Vec<String>,
+    pub memory_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -134,10 +191,25 @@ impl App {
         debug_mode: bool,
         input_price_per_1m: Option<f64>,
         output_price_per_1m: Option<f64>,
+        memory_dir: PathBuf,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
         input.set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
+
+        // Scan for system files and subagents
+        let system_files = vec!["AGENT.md".to_string()];
+        let subagent_dir = memory_dir.join("subagents");
+        let subagent_files = std::fs::read_dir(&subagent_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Self {
             messages: Vec::new(),
@@ -164,6 +236,16 @@ impl App {
             usage: UsageStats::default(),
             input_price_per_1m,
             output_price_per_1m,
+            left_panel_visible: false,
+            right_panel_visible: false,
+            left_panel_focused: false,
+            left_panel_section: LeftPanelSection::Models,
+            left_panel_index: 0,
+            right_panel_events: VecDeque::new(),
+            right_panel_scroll: 0,
+            system_files,
+            subagent_files,
+            memory_dir,
         }
     }
 
@@ -417,6 +499,115 @@ impl App {
         self.input
             .set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
         text
+    }
+
+    pub fn handle_domain_event(&mut self, event: Event) {
+        let ts = event.timestamp.format("%H:%M:%S").to_string();
+        let (icon, kind, detail) = match &event.kind {
+            EventKind::AgentProcessingStarted { .. } => (
+                "▶", "Processing".into(), String::new(),
+            ),
+            EventKind::AgentProcessingCompleted { success, .. } => (
+                if *success { "✓" } else { "✗" },
+                "Completed".into(),
+                if *success { String::new() } else { "with errors".into() },
+            ),
+            EventKind::LlmCallStarted { iteration } => (
+                "⚡", "LLM call".into(), format!("iteration {}", iteration + 1),
+            ),
+            EventKind::LlmCallCompleted { has_tool_calls, usage } => {
+                let tokens = usage.as_ref()
+                    .map(|u| format!("↑{} ↓{}", u.input_tokens, u.output_tokens))
+                    .unwrap_or_default();
+                let tools = if *has_tool_calls { " +tools" } else { "" };
+                ("✓", "LLM done".into(), format!("{tokens}{tools}"))
+            }
+            EventKind::ToolCallRequested { tool_name, arguments, .. } => {
+                let args_short = if arguments.len() > 60 {
+                    format!("{}...", &arguments[..arguments.floor_char_boundary(60)])
+                } else {
+                    arguments.clone()
+                };
+                ("🔧", format!("Tool: {tool_name}"), args_short)
+            }
+            EventKind::ToolCallCompleted { call_id: _, result_preview, is_error, duration_ms } => {
+                let icon = if *is_error { "✗" } else { "✓" };
+                let preview = if result_preview.len() > 60 {
+                    format!("{}...", &result_preview[..result_preview.floor_char_boundary(60)])
+                } else {
+                    result_preview.clone()
+                };
+                (icon, "Tool done".into(), format!("{preview} ({duration_ms}ms)"))
+            }
+            EventKind::IntentionEmitted { intention_tag, .. } => (
+                "📋", "Intention".into(), intention_tag.clone(),
+            ),
+            EventKind::IntentionEvaluated { intention_tag, verdict } => (
+                "📝", "Contract".into(), format!("{intention_tag}: {verdict}"),
+            ),
+            EventKind::ApprovalRequested { description, .. } => (
+                "⚠", "Approval".into(), description.clone(),
+            ),
+            EventKind::ApprovalDecided { approved, .. } => (
+                if *approved { "✓" } else { "✗" },
+                "Decision".into(),
+                if *approved { "approved".into() } else { "rejected".into() },
+            ),
+            EventKind::ResponseReady { .. } => (
+                "📨", "Response".into(), String::new(),
+            ),
+            EventKind::WorkflowStarted { node_count, .. } => (
+                "🔀", "Workflow".into(), format!("{node_count} nodes"),
+            ),
+            EventKind::WorkflowNodeStarted { node_id, description } => (
+                "▶", format!("WF:{node_id}"), description.clone(),
+            ),
+            EventKind::WorkflowNodeCompleted { node_id, success } => (
+                if *success { "✓" } else { "✗" },
+                format!("WF:{node_id}"), String::new(),
+            ),
+            EventKind::WorkflowCompleted { success } => (
+                if *success { "✓" } else { "✗" },
+                "WF done".into(), String::new(),
+            ),
+            _ => return, // Skip UserMessageReceived, ScheduledTaskTriggered
+        };
+
+        self.right_panel_events.push_back(ObservabilityEntry {
+            timestamp: ts,
+            icon,
+            kind,
+            detail,
+        });
+
+        // Cap at MAX_OBSERVABILITY_ENTRIES
+        while self.right_panel_events.len() > MAX_OBSERVABILITY_ENTRIES {
+            self.right_panel_events.pop_front();
+        }
+    }
+
+    /// Number of items in the currently focused left panel section.
+    pub fn left_panel_section_len(&self) -> usize {
+        match self.left_panel_section {
+            LeftPanelSection::Models => self.available_models.len(),
+            LeftPanelSection::SystemFiles => self.system_files.len(),
+            LeftPanelSection::SubAgents => self.subagent_files.len(),
+        }
+    }
+
+    /// Get the file path for the selected item in the left panel (for opening in editor).
+    pub fn left_panel_selected_path(&self) -> Option<PathBuf> {
+        match self.left_panel_section {
+            LeftPanelSection::Models => None, // Models are switched, not opened
+            LeftPanelSection::SystemFiles => {
+                self.system_files.get(self.left_panel_index)
+                    .map(|f| self.memory_dir.join(f))
+            }
+            LeftPanelSection::SubAgents => {
+                self.subagent_files.get(self.left_panel_index)
+                    .map(|f| self.memory_dir.join("subagents").join(f))
+            }
+        }
     }
 
     pub fn handle_command(&mut self, cmd: &str) -> bool {

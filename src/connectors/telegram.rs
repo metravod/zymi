@@ -16,6 +16,8 @@ use crate::core::approval::{ApprovalHandler, ApprovalSlotGuard, SharedApprovalHa
 use crate::core::provider_manager::ProviderManager;
 use crate::core::transcription::TranscriptionService;
 use crate::core::{ContentPart, LlmError};
+use crate::events::bus::EventBus;
+use crate::events::connector::EventDrivenConnector;
 use crate::tools::ask_user::UserQuestion;
 
 const TELEGRAM_MSG_LIMIT: usize = 4096;
@@ -328,6 +330,8 @@ pub async fn run(
     provider_manager: Arc<ProviderManager>,
     shared_approval: SharedApprovalHandler,
     ask_user_rx: mpsc::UnboundedReceiver<UserQuestion>,
+    event_bus: Arc<EventBus>,
+    stream_registry: Arc<crate::events::stream_registry::StreamRegistry>,
 ) {
     let bot = bot_with_timeout();
     let allowed_users = match allowed_users() {
@@ -354,6 +358,7 @@ pub async fn run(
     );
 
     let pending_for_handler = pending.clone();
+    let connector = Arc::new(EventDrivenConnector::new(event_bus, stream_registry));
 
     // Forward ask_user questions to the active Telegram chat
     tokio::spawn(ask_user_forwarder(
@@ -383,7 +388,8 @@ pub async fn run(
             start_time,
             pending_questions.clone(),
             active_chat,
-            transcription
+            transcription,
+            connector
         ])
         // Allow callback queries and ask_user replies to run concurrently.
         // Without this, ask_user deadlocks: gpt_handler waits for the user's
@@ -586,6 +592,7 @@ async fn gpt_handler(
     pending_questions: PendingQuestions,
     active_chat: ActiveChat,
     transcription: SharedTranscription,
+    connector: Arc<EventDrivenConnector>,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
 
@@ -712,8 +719,15 @@ async fn gpt_handler(
     }
 
     let start = std::time::Instant::now();
-    let result = agent
-        .process_multimodal(&conversation_id, user_message, Some(approval_handler.as_ref()))
+
+    // EDA: route through EventDrivenConnector → EventBus → AgentWorker
+    let result = connector
+        .submit_and_wait(
+            &conversation_id,
+            user_message,
+            "telegram",
+            Duration::from_secs(600),
+        )
         .await;
 
     // Clear active chat
@@ -727,7 +741,7 @@ async fn gpt_handler(
     match result {
         Ok(answer) if !answer.is_empty() => {
             log::info!(
-                "Telegram reply: chat_id={}, {:?}, response_len={}",
+                "Telegram reply (EDA): chat_id={}, {:?}, response_len={}",
                 chat_id,
                 start.elapsed(),
                 answer.len()
@@ -735,17 +749,20 @@ async fn gpt_handler(
             send_long_message(&bot, chat_id, &answer).await?;
         }
         Ok(_) => {
-            // Empty response (e.g. ask_user superseded by photo) — nothing to send
-            log::info!("Telegram: chat_id={}, {:?}, suppressed empty response", chat_id, start.elapsed());
+            log::info!("Telegram (EDA): chat_id={}, {:?}, suppressed empty response", chat_id, start.elapsed());
         }
         Err(e) => {
-            log::error!("LLM error after {:?}: {e}", start.elapsed());
+            log::error!("EDA connector error after {:?}: {e}", start.elapsed());
             let user_msg = match e {
-                LlmError::RequestBuildError(_) => "Request build error",
-                LlmError::ApiError(_) => "API error",
-                LlmError::EmptyResponse => "Empty response from model",
-                LlmError::StorageError(_) => "Storage error",
-                LlmError::ApprovalError(_) => "Approval error",
+                crate::events::connector::ConnectorError::Timeout => {
+                    "Processing timed out. Please try again."
+                }
+                crate::events::connector::ConnectorError::PublishFailed(_) => {
+                    "Failed to submit message. Please try again."
+                }
+                crate::events::connector::ConnectorError::BusClosed => {
+                    "Internal error: event bus closed."
+                }
             };
             bot.send_message(chat_id, user_msg).await?;
         }

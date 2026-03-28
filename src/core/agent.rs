@@ -12,6 +12,7 @@ use crate::core::approval::ApprovalHandler;
 use crate::core::langfuse::{self, LangfuseClient, TraceCtx};
 use crate::core::tool_selector::ToolSelector;
 use crate::core::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
+use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
 use crate::events::{Event, EventKind};
 use crate::mcp::McpManager;
@@ -112,6 +113,7 @@ pub struct Agent {
     last_extract_ms: AtomicI64,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
     event_bus: Option<Arc<EventBus>>,
+    orchestrator: Option<Arc<Orchestrator>>,
 }
 
 impl Agent {
@@ -139,6 +141,7 @@ impl Agent {
             last_extract_ms: AtomicI64::new(0),
             mcp_manager: None,
             event_bus: None,
+            orchestrator: None,
         }
     }
 
@@ -194,6 +197,11 @@ impl Agent {
 
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(bus);
+        self
+    }
+
+    pub fn with_orchestrator(mut self, orchestrator: Arc<Orchestrator>) -> Self {
+        self.orchestrator = Some(orchestrator);
         self
     }
 
@@ -586,7 +594,7 @@ impl Agent {
         Ok((messages, history_len))
     }
 
-    /// Execute a single tool call: dedup check, approval, execution.
+    /// Execute a single tool call: dedup check, ESAA orchestration or legacy approval, execution.
     /// Returns `(result_text, is_duplicate)`.
     async fn execute_tool_call(
         &self,
@@ -594,6 +602,7 @@ impl Agent {
         explanation: Option<&str>,
         approval_handler: Option<&dyn ApprovalHandler>,
         tool_call_cache: &mut HashMap<String, ()>,
+        conversation_id: &str,
     ) -> Result<(String, bool), LlmError> {
         let dedup_key = tool_dedup_key(&tool_call.name, &tool_call.arguments);
         if tool_call_cache.contains_key(&dedup_key) {
@@ -616,46 +625,91 @@ impl Agent {
 
         let result = match tool_arc {
             Some(ref tool) => {
-                if tool.requires_approval_for(&tool_call.arguments) {
-                    let description = tool.format_approval_request(&tool_call.arguments);
-                    let approval_id = uuid::Uuid::new_v4().to_string();
-
-                    self.emit_event(&tool_call.id, EventKind::ApprovalRequested {
-                        description: description.clone(),
-                        approval_id: approval_id.clone(),
-                    });
-
-                    let approved = if let Some(handler) = approval_handler {
-                        handler
-                            .request_approval(&description, explanation)
-                            .await
-                            .map_err(LlmError::ApprovalError)?
+                // ESAA path: route through orchestrator when tool supports intentions
+                let esaa_verdict = if let Some(ref orchestrator) = self.orchestrator {
+                    if let Some(intention) = tool.to_intention(&tool_call.arguments) {
+                        let correlation_id = uuid::Uuid::new_v4();
+                        Some(
+                            orchestrator
+                                .process_intention(
+                                    &intention,
+                                    conversation_id,
+                                    correlation_id,
+                                    approval_handler,
+                                )
+                                .await,
+                        )
                     } else {
-                        log::warn!(
-                            "Tool '{}' requires approval but no handler available",
-                            tool_call.name
-                        );
-                        false
-                    };
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                    self.emit_event(&tool_call.id, EventKind::ApprovalDecided {
-                        approval_id,
-                        approved,
-                    });
-
-                    if !approved {
-                        "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
-                    } else {
+                match esaa_verdict {
+                    Some(OrchestratorResult::Approved) => {
+                        log::info!("ESAA: tool '{}' approved by orchestrator", tool_call.name);
                         tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
                             log::error!("Tool '{}' error: {}", tool_call.name, e);
                             format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
                         })
                     }
-                } else {
-                    tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
-                        log::error!("Tool '{}' error: {}", tool_call.name, e);
-                        format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
-                    })
+                    Some(OrchestratorResult::Denied { reason }) => {
+                        log::info!("ESAA: tool '{}' denied: {reason}", tool_call.name);
+                        format!("Tool execution denied: {reason}")
+                    }
+                    Some(OrchestratorResult::HumanRejected) => {
+                        log::info!("ESAA: tool '{}' rejected by user", tool_call.name);
+                        "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
+                    }
+                    Some(OrchestratorResult::NoApprovalHandler) => {
+                        log::warn!("ESAA: tool '{}' requires approval but no handler", tool_call.name);
+                        "Tool execution requires approval but no approval handler is available.".to_string()
+                    }
+                    None => {
+                        // Legacy path: no orchestrator or tool doesn't support intentions
+                        if tool.requires_approval_for(&tool_call.arguments) {
+                            let description = tool.format_approval_request(&tool_call.arguments);
+                            let approval_id = uuid::Uuid::new_v4().to_string();
+
+                            self.emit_event(conversation_id, EventKind::ApprovalRequested {
+                                description: description.clone(),
+                                approval_id: approval_id.clone(),
+                            });
+
+                            let approved = if let Some(handler) = approval_handler {
+                                handler
+                                    .request_approval(&description, explanation)
+                                    .await
+                                    .map_err(LlmError::ApprovalError)?
+                            } else {
+                                log::warn!(
+                                    "Tool '{}' requires approval but no handler available",
+                                    tool_call.name
+                                );
+                                false
+                            };
+
+                            self.emit_event(conversation_id, EventKind::ApprovalDecided {
+                                approval_id,
+                                approved,
+                            });
+
+                            if !approved {
+                                "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
+                            } else {
+                                tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
+                                    log::error!("Tool '{}' error: {}", tool_call.name, e);
+                                    format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
+                                })
+                            }
+                        } else {
+                            tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
+                                log::error!("Tool '{}' error: {}", tool_call.name, e);
+                                format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
+                            })
+                        }
+                    }
                 }
             }
             None => {
@@ -847,6 +901,7 @@ impl Agent {
                         explanation.as_deref(),
                         approval_handler,
                         &mut tool_call_cache,
+                        conversation_id,
                     )
                     .await?;
                 let tool_end = langfuse::timestamp();
@@ -923,21 +978,22 @@ impl Agent {
     pub async fn process_stream(
         &self,
         conversation_id: &str,
-        user_message: &str,
+        user_message: Message,
         approval_handler: Option<&dyn ApprovalHandler>,
         event_tx: mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<String, LlmError> {
+        let user_text = user_message.user_text().unwrap_or("").to_string();
         log::info!(
             "Agent process_stream: conversation_id={}, message_len={}",
             conversation_id,
-            user_message.len()
+            user_text.len()
         );
 
-        let trace = self.trace_ctx(conversation_id, user_message);
+        let trace = self.trace_ctx(conversation_id, &user_text);
 
         // --- Workflow engine routing ---
         if let Some(ref engine) = self.workflow_engine {
-            match engine.process(user_message, event_tx.clone()).await {
+            match engine.process(&user_text, event_tx.clone()).await {
                 Ok(result) => {
                     // Connect new MCP servers discovered by workflow
                     if !result.new_mcp_servers.is_empty() {
@@ -959,8 +1015,8 @@ impl Agent {
             }
         }
 
-        let (mut messages, history_len) = self.prepare_messages(conversation_id, Message::User(user_message.to_string())).await?;
-        let tool_definitions = self.get_tool_definitions(user_message).await;
+        let (mut messages, history_len) = self.prepare_messages(conversation_id, user_message).await?;
+        let tool_definitions = self.get_tool_definitions(&user_text).await;
         let mut monitor_reviews: usize = 0;
         let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
         let mut msg_count = history_len;
@@ -1070,6 +1126,7 @@ impl Agent {
                         explanation.as_deref(),
                         approval_handler,
                         &mut tool_call_cache,
+                        conversation_id,
                     )
                     .await?;
                 let tool_end = langfuse::timestamp();

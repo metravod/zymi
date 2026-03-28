@@ -284,6 +284,7 @@ struct App {
     audit_log: audit::AuditLog,
     sandbox: Arc<sandbox::SandboxManager>,
     event_bus: Arc<events::bus::EventBus>,
+    stream_registry: Arc<events::stream_registry::StreamRegistry>,
 }
 
 async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
@@ -306,6 +307,7 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
             .with_context(|| "Failed to initialize event store")?,
     );
     let event_bus = Arc::new(events::bus::EventBus::new(event_store));
+    let stream_registry = Arc::new(events::stream_registry::StreamRegistry::new());
 
     let agent_prompt_path = memory_dir.join("AGENT.md");
     let system_prompt = std::fs::read_to_string(&agent_prompt_path).unwrap_or_else(|e| {
@@ -500,6 +502,21 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
 
     agent_builder = agent_builder.with_event_bus(event_bus.clone());
 
+    // ESAA: Orchestrator routes tool calls through boundary contracts
+    let file_contract = esaa::contracts::FileWriteContract {
+        allowed_dirs: vec!["./memory/".into(), "/tmp/".into()],
+        deny_patterns: vec!["*.env".into(), "*.key".into(), "*.pem".into()],
+    };
+    let contract_engine = Arc::new(esaa::contracts::ContractEngine::new(
+        policy_engine.clone(),
+        file_contract,
+    ));
+    let orchestrator = Arc::new(esaa::orchestrator::Orchestrator::new(
+        contract_engine,
+        event_bus.clone(),
+    ));
+    agent_builder = agent_builder.with_orchestrator(orchestrator);
+
     let agent = Arc::new(agent_builder);
 
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -522,6 +539,7 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         audit_log,
         sandbox: sandbox_manager,
         event_bus,
+        stream_registry,
     })
 }
 
@@ -667,6 +685,7 @@ async fn main() -> Result<()> {
         app.agent.clone(),
         app.event_bus.clone(),
         app.shared_approval_handler.clone(),
+        app.stream_registry.clone(),
     ));
     bg_handles.push(tokio::spawn(async move { agent_worker.run().await }));
 
@@ -684,13 +703,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Cli) => {
+            let cli_connector = Arc::new(events::connector::EventDrivenConnector::new(
+                app.event_bus.clone(),
+                app.stream_registry.clone(),
+            ));
             connectors::cli::run(
-                app.agent,
+                cli_connector,
+                app.event_bus.clone(),
                 app.provider_manager,
                 app.shared_approval_handler,
                 app.debug_rx,
                 &app.models_config,
                 app.ask_user_rx,
+                app.memory_dir.clone(),
             )
             .await;
         }
@@ -728,6 +753,8 @@ async fn main() -> Result<()> {
                     app.provider_manager,
                     app.shared_approval_handler,
                     app.ask_user_rx,
+                    app.event_bus.clone(),
+                    app.stream_registry.clone(),
                 )
                 .await;
             } else {

@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::core::agent::Agent;
 use crate::core::approval::SharedApprovalHandler;
+use crate::core::StreamEvent;
 
 use super::bus::EventBus;
+use super::stream_registry::StreamRegistry;
 use super::{Event, EventKind};
 
 /// Consumes inbound events (UserMessageReceived, ScheduledTaskTriggered) and drives
@@ -17,11 +20,17 @@ pub struct AgentWorker {
     agent: Arc<Agent>,
     bus: Arc<EventBus>,
     shared_approval: SharedApprovalHandler,
+    stream_registry: Arc<StreamRegistry>,
 }
 
 impl AgentWorker {
-    pub fn new(agent: Arc<Agent>, bus: Arc<EventBus>, shared_approval: SharedApprovalHandler) -> Self {
-        Self { agent, bus, shared_approval }
+    pub fn new(
+        agent: Arc<Agent>,
+        bus: Arc<EventBus>,
+        shared_approval: SharedApprovalHandler,
+        stream_registry: Arc<StreamRegistry>,
+    ) -> Self {
+        Self { agent, bus, shared_approval, stream_registry }
     }
 
     /// Run the worker loop. First recovers orphaned events from a prior crash,
@@ -102,27 +111,33 @@ impl AgentWorker {
         // For scheduled tasks there may be no handler (approval goes to Telegram if configured).
         let approval_handler = self.shared_approval.read().await.clone();
 
-        let result = match &event.kind {
-            EventKind::UserMessageReceived { content, .. } => {
-                self.agent
-                    .process_multimodal(
-                        &stream_id,
-                        content.clone(),
-                        approval_handler.as_deref(),
-                    )
-                    .await
+        // Take the stream sender if one was registered (CLI path).
+        // For Telegram/scheduled tasks, no sender is registered — create a throwaway channel.
+        let corr_str = correlation_id.to_string();
+        let stream_tx = match self.stream_registry.take(&corr_str).await {
+            Some(tx) => tx,
+            None => {
+                let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+                tx
             }
+        };
+
+        let message = match &event.kind {
+            EventKind::UserMessageReceived { content, .. } => content.clone(),
             EventKind::ScheduledTaskTriggered { task, .. } => {
-                self.agent
-                    .process_multimodal(
-                        &stream_id,
-                        crate::core::Message::User(task.clone()),
-                        approval_handler.as_deref(),
-                    )
-                    .await
+                crate::core::Message::User(task.clone())
             }
             _ => return,
         };
+
+        let result = self.agent
+            .process_stream(
+                &stream_id,
+                message,
+                approval_handler.as_deref(),
+                stream_tx,
+            )
+            .await;
 
         let (success, response_content) = match result {
             Ok(content) => (true, content),

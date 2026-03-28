@@ -2,6 +2,7 @@ pub mod agent_worker;
 pub mod bus;
 pub mod connector;
 pub mod store;
+pub mod stream_registry;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -1,6 +1,7 @@
 # ESAA: Intention-based orchestrator with hash chain verification
 
 **Date:** 2026-03-26
+**Status:** Implemented. Wired into production path in ADR-0004.
 
 ## Context
 

@@ -1,17 +1,26 @@
-## Architecture Decision Records (ADR)
-Always create an Architecture Decision Record (ADR) whenever we make a significant architectural, structural, or technological decision during our session.
+## 🏗️ Architecture Decision Records (ADR)
+We use Architecture Decision Records in the `./adr/` directory to track important technical and structural decisions, avoid repeating discussions, and save tokens.
 
-Follow these steps immediately after the decision is made:**
-1. Create a new markdown file in the `./adr` directory.
-2. Name the file sequentially with a descriptive slug (e.g., `0001-use-rust-for-backend.md`).
-3. Format the file strictly using the standard ADR structure:
-   - # [Short descriptive title]
-   - Date:** [Current date]
-   - Context: [Briefly explain the problem and why we needed to make this decision]
-   - Decision: [What we specifically decided to do]
-   - Consequences: [Pros, cons, and technical implications of this decision]
-4. Notify me briefly in the chat that the ADR has been successfully created.
+When working on architecture or making significant decisions, ALWAYS follow this workflow:
 
+1. Scan Before Deciding:
+   - Run `ls ./adr/` (or use Glob tool) to review the titles of existing decisions.
+   - DO NOT read all ADR files. Only read the contents of specific files if their filenames directly relate to the current task.
+
+2. Document New Decisions:
+   - Create a new markdown file in `./adr/` named sequentially (e.g., `0005-use-polars-for-data.md`).
+   - Use this exact format:
+     - # [Title]
+     - Date: [Current Date]
+     - Context: [Why we need this]
+     - Decision: [What we decided]
+     - Consequences: [Pros, cons, and tech implications]
+
+3. Update Existing Records:
+   - If our new decision changes, overrides, or deprecates a previous decision, you must update the old ADR file.
+   - Add a "Status" line to the old file (e.g., `Status: Superseded by 0005`) so our historical context remains accurate.
+
+4. Notify: Tell me briefly in the chat when an ADR is created or updated.
 
 
 ## drift

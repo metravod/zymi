@@ -4,42 +4,52 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AddModelStep, App, ChatEntry, PROVIDER_OPTIONS};
+use super::app::{AddModelStep, App, ChatEntry, LeftPanelSection, PROVIDER_OPTIONS};
 use super::markdown::render_markdown;
 use super::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // Dynamic input height: grows with content, capped at 1/3 of screen
-    let input_lines = app.input.lines().len().max(1) as u16;
-    let max_input_height = (f.area().height / 3).max(3);
-    let input_height = (input_lines + 2).clamp(3, max_input_height);
+    let terminal_width = f.area().width;
 
-    let constraints = vec![
-        Constraint::Length(6), // header
-        Constraint::Min(5),   // chat area
-        Constraint::Length(1), // status line
-        Constraint::Length(input_height), // input
-    ];
+    // Auto-collapse panels on narrow terminals
+    let show_left = app.left_panel_visible && terminal_width >= 100;
+    let show_right = app.right_panel_visible && terminal_width >= 100;
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
+    let left_width: u16 = if show_left { 28 } else { 0 };
+    let right_width: u16 = if show_right { 36 } else { 0 };
+
+    // Build horizontal constraints
+    let mut h_constraints = Vec::new();
+    if show_left {
+        h_constraints.push(Constraint::Length(left_width));
+    }
+    h_constraints.push(Constraint::Min(40)); // center
+    if show_right {
+        h_constraints.push(Constraint::Length(right_width));
+    }
+
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(h_constraints)
         .split(f.area());
 
-    // Header
-    draw_header(f, chunks[0], &app.current_model_id, app.copy_mode);
+    let center_idx = if show_left { 1 } else { 0 };
 
-    // Chat area
-    draw_chat(f, app, chunks[1]);
+    // Left panel
+    if show_left {
+        draw_left_panel(f, app, h_chunks[0]);
+    }
 
-    // Status line
-    draw_status_line(f, app, chunks[2]);
+    // Center column
+    draw_center_column(f, app, h_chunks[center_idx]);
 
-    // Input
-    draw_input(f, app, chunks[3]);
+    // Right panel
+    if show_right {
+        let right_idx = h_chunks.len() - 1;
+        draw_right_panel(f, app, h_chunks[right_idx]);
+    }
 
-    // Overlays (rendered on top)
-
+    // Overlays (rendered on top of everything)
     if app.model_selector_open {
         draw_model_selector(f, app);
     }
@@ -47,6 +57,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.add_model_form.is_some() {
         draw_add_model_form(f, app);
     }
+}
+
+fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
+    let input_lines = app.input.lines().len().max(1) as u16;
+    let max_input_height = (area.height / 3).max(3);
+    let input_height = (input_lines + 2).clamp(3, max_input_height);
+
+    let constraints = vec![
+        Constraint::Length(6),  // header
+        Constraint::Min(5),    // chat area
+        Constraint::Length(1), // status line
+        Constraint::Length(input_height), // input
+        Constraint::Length(1), // hint bar
+    ];
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    draw_header(f, chunks[0], &app.current_model_id, app.copy_mode);
+    draw_chat(f, app, chunks[1]);
+    draw_status_line(f, app, chunks[2]);
+    draw_input(f, app, chunks[3]);
+    draw_hint_bar(f, app, chunks[4]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
@@ -713,6 +748,196 @@ fn draw_add_model_form(f: &mut Frame, app: &App) {
     );
 
     f.render_widget(popup, popup_area);
+}
+
+fn draw_left_panel(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.left_panel_focused;
+    let border_color = if focused { theme::ACCENT } else { theme::BORDER };
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Sidebar ",
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(theme::SUBTEXT);
+    let section_style = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+
+    // Models section
+    let models_active = app.left_panel_section == LeftPanelSection::Models;
+    let models_header = if models_active { "▸ Models" } else { "▹ Models" };
+    lines.push(Line::from(Span::styled(models_header, section_style)));
+
+    if models_active {
+        for (i, model) in app.available_models.iter().enumerate() {
+            let is_current = model.id == app.current_model_id;
+            let is_selected = focused && i == app.left_panel_index;
+            let marker = if is_current { "* " } else { "  " };
+
+            let style = if is_selected {
+                Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(theme::ACCENT)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+
+            let name = truncate_str(&format!("{}{}", marker, model.name), inner.width as usize - 1);
+            lines.push(Line::from(Span::styled(name, style)));
+        }
+    }
+
+    lines.push(Line::default());
+
+    // System Files section
+    let sysfiles_active = app.left_panel_section == LeftPanelSection::SystemFiles;
+    let sysfiles_header = if sysfiles_active { "▸ System Files" } else { "▹ System Files" };
+    lines.push(Line::from(Span::styled(sysfiles_header, section_style)));
+
+    if sysfiles_active {
+        for (i, file) in app.system_files.iter().enumerate() {
+            let is_selected = focused && i == app.left_panel_index;
+            let style = if is_selected {
+                Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            };
+            lines.push(Line::from(Span::styled(format!("  {file}"), style)));
+        }
+    }
+
+    lines.push(Line::default());
+
+    // SubAgents section
+    let subagents_active = app.left_panel_section == LeftPanelSection::SubAgents;
+    let subagents_header = if subagents_active { "▸ SubAgents" } else { "▹ SubAgents" };
+    lines.push(Line::from(Span::styled(subagents_header, section_style)));
+
+    if subagents_active {
+        if app.subagent_files.is_empty() {
+            lines.push(Line::from(Span::styled("  (none)", dim)));
+        } else {
+            for (i, file) in app.subagent_files.iter().enumerate() {
+                let is_selected = focused && i == app.left_panel_index;
+                let name = file.trim_end_matches(".md");
+                let style = if is_selected {
+                    Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    dim
+                };
+                lines.push(Line::from(Span::styled(format!("  {name}"), style)));
+            }
+        }
+    }
+
+    let panel = Paragraph::new(lines);
+    f.render_widget(panel, inner);
+}
+
+fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Events ",
+            Style::default().fg(theme::BORDER).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.right_panel_events.is_empty() {
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "No events yet",
+            Style::default().fg(theme::SUBTEXT),
+        )));
+        f.render_widget(placeholder, inner);
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(theme::SUBTEXT);
+
+    for entry in &app.right_panel_events {
+        // Timestamp + icon + kind
+        let kind_style = if entry.kind.starts_with("Tool") || entry.kind.starts_with("WF:") {
+            Style::default().fg(theme::TOOL)
+        } else if entry.kind.contains("LLM") {
+            Style::default().fg(theme::ACCENT)
+        } else if entry.kind == "Intention" || entry.kind == "Contract" {
+            Style::default().fg(theme::WARNING)
+        } else if entry.kind == "Response" || entry.kind == "Completed" {
+            Style::default().fg(theme::SUCCESS)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", entry.timestamp), dim),
+            Span::styled(format!("{} ", entry.icon), kind_style),
+            Span::styled(entry.kind.clone(), kind_style),
+        ]));
+
+        if !entry.detail.is_empty() {
+            let detail = truncate_str(&entry.detail, inner.width.saturating_sub(4) as usize);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(detail, dim),
+            ]));
+        }
+    }
+
+    // Auto-scroll to bottom
+    let total_height = lines.len() as u16;
+    let visible = inner.height;
+    let scroll = total_height.saturating_sub(visible);
+
+    let panel = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(panel, inner);
+}
+
+fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().fg(theme::SUBTEXT);
+    let key_style = Style::default().fg(theme::ACCENT);
+
+    let hints = if app.left_panel_focused {
+        vec![
+            Span::styled(" F1", key_style), Span::styled(":Hide ", dim),
+            Span::styled("Tab", key_style), Span::styled(":Section ", dim),
+            Span::styled("Up/Dn", key_style), Span::styled(":Nav ", dim),
+            Span::styled("Enter", key_style), Span::styled(":Select ", dim),
+            Span::styled("Esc", key_style), Span::styled(":Back", dim),
+        ]
+    } else {
+        let mut h = vec![
+            Span::styled(" F1", key_style), Span::styled(":Sidebar", dim),
+        ];
+        if app.left_panel_visible {
+            h.push(Span::styled("*", Style::default().fg(theme::SUCCESS)));
+        }
+        h.extend([
+            Span::styled(" F2", key_style), Span::styled(":Events", dim),
+        ]);
+        if app.right_panel_visible {
+            h.push(Span::styled("*", Style::default().fg(theme::SUCCESS)));
+        }
+        h.extend([
+            Span::styled(" ^M", key_style), Span::styled(":Model ", dim),
+            Span::styled("^Y", key_style), Span::styled(":Copy ", dim),
+            Span::styled("Esc", key_style), Span::styled(":Quit", dim),
+        ]);
+        h
+    };
+
+    let line = Line::from(hints);
+    let bar = Paragraph::new(line).style(Style::default().bg(theme::SURFACE));
+    f.render_widget(bar, area);
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

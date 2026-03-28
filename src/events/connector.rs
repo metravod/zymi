@@ -1,23 +1,28 @@
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::core::StreamEvent;
+
 use super::bus::EventBus;
+use super::stream_registry::StreamRegistry;
 use super::{Event, EventKind};
 
 /// Adapter for connectors (Telegram, CLI, scheduler) to publish events and await responses.
 ///
 /// Usage: the connector sets up its approval handler (ApprovalSlotGuard) as usual,
-/// then calls `submit_and_wait()` instead of `agent.process_multimodal()`.
+/// then calls `submit_and_wait()` or `submit_and_wait_streaming()`.
 /// The approval handler remains active in the connector's scope while the
 /// AgentWorker processes the event asynchronously.
 pub struct EventDrivenConnector {
     bus: Arc<EventBus>,
+    stream_registry: Arc<StreamRegistry>,
 }
 
 impl EventDrivenConnector {
-    pub fn new(bus: Arc<EventBus>) -> Self {
-        Self { bus }
+    pub fn new(bus: Arc<EventBus>, stream_registry: Arc<StreamRegistry>) -> Self {
+        Self { bus, stream_registry }
     }
 
     /// Publish a UserMessageReceived event and wait for the matching ResponseReady.
@@ -103,6 +108,77 @@ impl EventDrivenConnector {
 
         Ok(correlation_id)
     }
+
+    /// Publish a UserMessageReceived event, register a StreamEvent sender for
+    /// real-time streaming, and wait for the matching ResponseReady.
+    ///
+    /// The `stream_tx` is registered in the StreamRegistry so that the
+    /// AgentWorker can forward StreamEvents (tokens, tool calls, etc.)
+    /// directly to the caller while processing.
+    ///
+    /// Returns the final response content, or an error on timeout.
+    pub async fn submit_and_wait_streaming(
+        &self,
+        conversation_id: &str,
+        message: crate::core::Message,
+        source: &str,
+        timeout: std::time::Duration,
+        stream_tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<String, ConnectorError> {
+        let correlation_id = Uuid::new_v4();
+        let corr_str = correlation_id.to_string();
+
+        // Register stream sender BEFORE publishing to avoid race condition
+        self.stream_registry.register(&corr_str, stream_tx).await;
+
+        // Subscribe BEFORE publishing
+        let mut rx = self.bus.subscribe().await;
+
+        let event = Event::new(
+            conversation_id.into(),
+            EventKind::UserMessageReceived {
+                content: message,
+                connector: source.into(),
+            },
+            source.into(),
+        )
+        .with_correlation(correlation_id);
+
+        if let Err(e) = self.bus.publish(event).await {
+            self.stream_registry.remove(&corr_str).await;
+            return Err(ConnectorError::PublishFailed(e.to_string()));
+        }
+
+        // Wait for ResponseReady with matching correlation_id
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
+        let result = loop {
+            tokio::select! {
+                maybe_event = rx.recv() => {
+                    match maybe_event {
+                        Some(event) if event.correlation_id == Some(correlation_id) => {
+                            if let EventKind::ResponseReady { content, .. } = event.kind {
+                                break Ok(content);
+                            }
+                        }
+                        Some(_) => continue,
+                        None => break Err(ConnectorError::BusClosed),
+                    }
+                }
+                _ = &mut deadline => {
+                    break Err(ConnectorError::Timeout);
+                }
+            }
+        };
+
+        // Cleanup on error
+        if result.is_err() {
+            self.stream_registry.remove(&corr_str).await;
+        }
+
+        result
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,18 +198,19 @@ mod tests {
     use crate::events::store::SqliteEventStore;
     use tempfile::TempDir;
 
-    async fn setup() -> (TempDir, Arc<EventBus>) {
+    async fn setup() -> (TempDir, Arc<EventBus>, Arc<StreamRegistry>) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_connector.db");
         let store = Arc::new(SqliteEventStore::new(&db_path).unwrap());
         let bus = Arc::new(EventBus::new(store));
-        (dir, bus)
+        let registry = Arc::new(StreamRegistry::new());
+        (dir, bus, registry)
     }
 
     #[tokio::test]
     async fn submit_and_wait_receives_response() {
-        let (_dir, bus) = setup().await;
-        let connector = EventDrivenConnector::new(bus.clone());
+        let (_dir, bus, registry) = setup().await;
+        let connector = EventDrivenConnector::new(bus.clone(), registry);
 
         // Simulate an AgentWorker: subscribe and echo back ResponseReady
         let bus_clone = bus.clone();
@@ -171,8 +248,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_and_wait_timeout() {
-        let (_dir, bus) = setup().await;
-        let connector = EventDrivenConnector::new(bus);
+        let (_dir, bus, registry) = setup().await;
+        let connector = EventDrivenConnector::new(bus, registry);
 
         // No worker running — should timeout
         let result = connector
@@ -189,8 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_fire_and_forget() {
-        let (_dir, bus) = setup().await;
-        let connector = EventDrivenConnector::new(bus.clone());
+        let (_dir, bus, registry) = setup().await;
+        let connector = EventDrivenConnector::new(bus.clone(), registry);
 
         let corr = connector
             .submit("test-conv", Message::User("hello".into()), "scheduler")

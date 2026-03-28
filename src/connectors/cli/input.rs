@@ -20,6 +20,7 @@ pub enum InputAction {
     AddModel(NewModelInfo),
     OpenEditor(PathBuf),
     ToggleCopyMode,
+    Interrupt,
     Quit,
     None,
 }
@@ -132,34 +133,29 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     // Left panel navigation when focused
     if app.left_panel_focused && app.left_panel_visible {
         return match key.code {
-            // Up/Down switches between sections (Models / Files / SubAgents)
+            // Up/Down navigates items within the current section
             KeyCode::Up => {
-                app.left_panel_section = app.left_panel_section.prev();
-                app.left_panel_index = 0;
+                if app.left_panel_index > 0 {
+                    app.left_panel_index -= 1;
+                }
                 InputAction::None
             }
             KeyCode::Down => {
+                let max = app.left_panel_section_len().saturating_sub(1);
+                if app.left_panel_index < max {
+                    app.left_panel_index += 1;
+                }
+                InputAction::None
+            }
+            // Tab/BackTab switches between sections (Models / Files / SubAgents)
+            KeyCode::Tab => {
                 app.left_panel_section = app.left_panel_section.next();
                 app.left_panel_index = 0;
                 InputAction::None
             }
-            // Tab/BackTab navigates items within the current section
-            KeyCode::Tab => {
-                let max = app.left_panel_section_len().saturating_sub(1);
-                if app.left_panel_index < max {
-                    app.left_panel_index += 1;
-                } else {
-                    app.left_panel_index = 0;
-                }
-                InputAction::None
-            }
             KeyCode::BackTab => {
-                if app.left_panel_index > 0 {
-                    app.left_panel_index -= 1;
-                } else {
-                    let max = app.left_panel_section_len().saturating_sub(1);
-                    app.left_panel_index = max;
-                }
+                app.left_panel_section = app.left_panel_section.prev();
+                app.left_panel_index = 0;
                 InputAction::None
             }
             // Right arrow moves focus to chat
@@ -229,7 +225,18 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             }
             InputAction::None
         }
-        KeyCode::Esc => InputAction::Quit,
+        // Esc interrupts agent processing
+        KeyCode::Esc => {
+            if app.is_processing {
+                InputAction::Interrupt
+            } else {
+                InputAction::None
+            }
+        }
+        // Q quits (only when input is empty and not processing)
+        KeyCode::Char('q') if key.modifiers.is_empty() && app.input.lines().join("").trim().is_empty() && !app.is_processing => {
+            InputAction::Quit
+        }
         KeyCode::Enter => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.input.insert_newline();

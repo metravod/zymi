@@ -186,7 +186,7 @@ impl App {
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
-        input.set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
+        input.set_placeholder_text("Type your message... (Enter to send, Q to quit)");
 
         // Scan for system files and subagents
         let system_files = vec!["AGENT.md".to_string()];
@@ -487,7 +487,7 @@ impl App {
         self.input = TextArea::default();
         self.input.set_cursor_line_style(ratatui::style::Style::default());
         self.input
-            .set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
+            .set_placeholder_text("Type your message... (Enter to send, Q to quit)");
         text
     }
 

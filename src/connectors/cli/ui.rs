@@ -110,8 +110,10 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
-    let art = Style::default()
-        .fg(theme::ACCENT)
+    // Filled block-style logo using Unicode block elements
+    let logo = Style::default()
+        .fg(theme::SURFACE)
+        .bg(theme::ACCENT)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme::SUBTEXT);
     let bold = Style::default()
@@ -120,21 +122,21 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let pad = "  ";
 
-    // Line 1: top of slant art
+    // Line 1: filled block art
     let line1 = Line::from(vec![
-        Span::styled("     ____  __  __  ____ ___   __", art),
+        Span::styled(" \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2557}", logo),
     ]);
 
-    // Line 2: middle + version
+    // Line 2 + version
     let line2 = Line::from(vec![
-        Span::styled("    /_  / / / / / / __ `__ \\ / /", art),
+        Span::styled(" \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
         Span::raw(pad),
         Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim),
     ]);
 
-    // Line 3: middle + model + copy mode
+    // Line 3 + model + copy mode
     let mut line3_spans = vec![
-        Span::styled("     / /_/ /_/ / / / / / / // /", art),
+        Span::styled("  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}\u{255a}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
         Span::raw(pad),
         Span::styled("model: ", dim),
         Span::styled(model.to_string(), bold),
@@ -163,13 +165,15 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let line4 = Line::from(vec![
-        Span::styled("    /___/\\__,_/ /_/ /_/ /_//_/", art),
+        Span::styled(" \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d} \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
         Span::raw(pad),
         Span::styled(cwd, dim),
     ]);
 
     // Line 5: empty spacer
-    let line5 = Line::default();
+    let line5 = Line::from(vec![
+        Span::styled(" \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}  \u{255a}\u{2550}\u{2550}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}", logo),
+    ]);
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
@@ -428,7 +432,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let (title, border_color, placeholder) = if app.pending_question.is_some() {
         (" reply > ", theme::WARNING, "Type your response... (Enter to send)")
     } else {
-        (" > ", theme::ACCENT, "Type your message... (Enter to send, Esc to quit)")
+        (" > ", theme::ACCENT, "Type your message... (Enter to send, Q to quit)")
     };
 
     let input_block = Block::default()
@@ -952,8 +956,8 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let hints = if app.left_panel_focused {
         vec![
-            Span::styled(" \u{2191}\u{2193}", key_style), Span::styled(":Section ", dim),
-            Span::styled("Tab", key_style), Span::styled(":Item ", dim),
+            Span::styled(" Tab", key_style), Span::styled(":Section ", dim),
+            Span::styled("\u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
             Span::styled("Enter", key_style), Span::styled(":Select ", dim),
             Span::styled("\u{2192}", key_style), Span::styled(":Chat ", dim),
             Span::styled("F1", key_style), Span::styled(":Hide ", dim),
@@ -979,7 +983,8 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         h.extend([
             Span::styled(" ^M", key_style), Span::styled(":Model ", dim),
             Span::styled("^Y", key_style), Span::styled(":Copy ", dim),
-            Span::styled("Esc", key_style), Span::styled(":Quit", dim),
+            Span::styled("Esc", key_style), Span::styled(":Stop ", dim),
+            Span::styled("Q", key_style), Span::styled(":Quit", dim),
         ]);
         h
     };

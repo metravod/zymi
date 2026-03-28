@@ -18,6 +18,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::core::approval::{ApprovalSlotGuard, SharedApprovalHandler};
 use crate::core::config::{ModelEntry, ModelsConfig, ProviderType};
@@ -128,6 +129,9 @@ pub async fn run(
     // Tick interval for spinner
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
 
+    // Track current agent task so we can abort on Esc
+    let mut agent_task: Option<JoinHandle<()>> = None;
+
     loop {
         // Draw UI
         terminal
@@ -154,7 +158,7 @@ pub async fn run(
                             let approval_tx = approval_tx.clone();
                             let shared_approval = shared_approval.clone();
 
-                            tokio::spawn(async move {
+                            agent_task = Some(tokio::spawn(async move {
                                 let approval_handler: Arc<dyn crate::core::approval::ApprovalHandler> =
                                     Arc::new(CliApprovalHandler::new(approval_tx));
 
@@ -177,7 +181,20 @@ pub async fn run(
                                 if let Err(e) = result {
                                     let _ = tx.send(StreamEvent::Error(e.to_string()));
                                 }
-                            });
+                            }));
+                        }
+                        InputAction::Interrupt => {
+                            if let Some(handle) = agent_task.take() {
+                                handle.abort();
+                            }
+                            app.is_processing = false;
+                            app.pending_approval = None;
+                            app.messages.push(app::ChatEntry::SystemMessage(
+                                "Interrupted.".to_string(),
+                            ));
+                            if app.auto_scroll {
+                                app.scroll_to_bottom();
+                            }
                         }
                         InputAction::AddModel(info) => {
                             let provider = match info.provider_index {

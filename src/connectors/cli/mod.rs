@@ -52,6 +52,7 @@ fn disable_mouse_scroll() {
     let _ = stdout.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     connector: Arc<EventDrivenConnector>,
     event_bus: Arc<EventBus>,

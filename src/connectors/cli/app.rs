@@ -73,14 +73,6 @@ pub enum LeftPanelSection {
 }
 
 impl LeftPanelSection {
-    pub fn title(&self) -> &'static str {
-        match self {
-            LeftPanelSection::Models => "Models",
-            LeftPanelSection::SystemFiles => "System Files",
-            LeftPanelSection::SubAgents => "SubAgents",
-        }
-    }
-
     pub fn next(&self) -> Self {
         match self {
             LeftPanelSection::Models => LeftPanelSection::SystemFiles,
@@ -139,7 +131,6 @@ pub struct App {
     pub left_panel_section: LeftPanelSection,
     pub left_panel_index: usize,
     pub right_panel_events: VecDeque<ObservabilityEntry>,
-    pub right_panel_scroll: u16,
     pub system_files: Vec<String>,
     pub subagent_files: Vec<String>,
     pub memory_dir: PathBuf,
@@ -242,7 +233,6 @@ impl App {
             left_panel_section: LeftPanelSection::Models,
             left_panel_index: 0,
             right_panel_events: VecDeque::new(),
-            right_panel_scroll: 0,
             system_files,
             subagent_files,
             memory_dir,

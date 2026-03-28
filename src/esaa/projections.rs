@@ -4,6 +4,7 @@ use crate::events::{Event, EventKind};
 /// A projection rebuilds state from an event stream.
 /// Projections are pure functions of the event history — calling apply()
 /// with the same events in the same order always produces the same state.
+#[allow(dead_code)]
 pub trait Projection: Send + Sync {
     /// Apply a single event to update the projection's state.
     fn apply(&mut self, event: &Event);
@@ -12,12 +13,14 @@ pub trait Projection: Send + Sync {
 /// Rebuilds a conversation's message list from events.
 /// This projection can be compared against direct ConversationStorage reads
 /// to verify that the event log and message store are consistent.
+#[allow(dead_code)]
 pub struct ConversationProjection {
     pub conversation_id: String,
     pub messages: Vec<Message>,
 }
 
 impl ConversationProjection {
+    #[allow(dead_code)]
     pub fn new(conversation_id: &str) -> Self {
         Self {
             conversation_id: conversation_id.to_string(),
@@ -49,6 +52,7 @@ impl Projection for ConversationProjection {
 
 /// Tracks aggregate metrics from events: LLM call count, tool call count,
 /// total token usage, error count.
+#[allow(dead_code)]
 pub struct MetricsProjection {
     pub llm_calls: u64,
     pub tool_calls: u64,
@@ -58,6 +62,7 @@ pub struct MetricsProjection {
 }
 
 impl MetricsProjection {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             llm_calls: 0,

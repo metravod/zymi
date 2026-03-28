@@ -23,6 +23,11 @@ When working on architecture or making significant decisions, ALWAYS follow this
 4. Notify: Tell me briefly in the chat when an ADR is created or updated.
 
 
+## Pre-push checklist
+
+Before pushing, always run `cargo clippy -- -D warnings` and fix all warnings. CI treats warnings as errors.
+
+
 ## drift
 
 This project is tracked by drift (.drift/project.json).

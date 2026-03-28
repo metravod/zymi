@@ -15,7 +15,7 @@ use crate::core::agent::Agent;
 use crate::core::approval::{ApprovalHandler, ApprovalSlotGuard, SharedApprovalHandler};
 use crate::core::provider_manager::ProviderManager;
 use crate::core::transcription::TranscriptionService;
-use crate::core::{ContentPart, LlmError};
+use crate::core::ContentPart;
 use crate::events::bus::EventBus;
 use crate::events::connector::EventDrivenConnector;
 use crate::tools::ask_user::UserQuestion;

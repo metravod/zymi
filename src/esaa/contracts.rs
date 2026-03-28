@@ -20,6 +20,7 @@ pub struct FileWriteContract {
 }
 
 /// Configuration for rate limiting intentions.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     /// Maximum shell commands per minute. 0 = unlimited.

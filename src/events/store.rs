@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use super::{Event, EventStoreError};
 
 /// Append-only event store. Events are immutable once written.
+#[allow(dead_code)]
 #[async_trait]
 pub trait EventStore: Send + Sync {
     /// Append an event to its stream. Assigns the next sequence number.
@@ -113,6 +114,7 @@ impl SqliteEventStore {
     }
 
     /// Create from an existing shared connection. Caller must ensure the events table exists.
+    #[allow(dead_code)]
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }

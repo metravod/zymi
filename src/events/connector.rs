@@ -83,6 +83,7 @@ impl EventDrivenConnector {
 
     /// Fire-and-forget: publish an event without waiting for a response.
     /// Useful for scheduled tasks where the result goes to a notification channel.
+    #[allow(dead_code)]
     pub async fn submit(
         &self,
         conversation_id: &str,

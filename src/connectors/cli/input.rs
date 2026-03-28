@@ -188,11 +188,7 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         // F1 toggles left panel
         KeyCode::F(1) => {
             app.left_panel_visible = !app.left_panel_visible;
-            if !app.left_panel_visible {
-                app.left_panel_focused = false;
-            } else {
-                app.left_panel_focused = true;
-            }
+            app.left_panel_focused = app.left_panel_visible;
             InputAction::None
         }
         // F2 toggles right panel

@@ -520,19 +520,32 @@ impl App {
                 if *success { String::new() } else { "with errors".into() },
                 format!("conversation: {conversation_id}, success: {success}"),
             ),
-            EventKind::LlmCallStarted { iteration } => (
-                "⚡", "LLM call".into(), format!("iteration {}", iteration + 1),
-                format!("iteration: {}", iteration + 1),
-            ),
-            EventKind::LlmCallCompleted { has_tool_calls, usage } => {
+            EventKind::LlmCallStarted { iteration, message_count, approx_context_chars } => {
+                let ctx_k = *approx_context_chars / 1024;
+                (
+                    "⚡", "LLM call".into(),
+                    format!("iter {} | {}msg ~{}k", iteration + 1, message_count, ctx_k),
+                    format!("iteration: {}\nmessages: {}\napprox context: {} chars (~{}k)", iteration + 1, message_count, approx_context_chars, ctx_k),
+                )
+            }
+            EventKind::LlmCallCompleted { has_tool_calls, usage, content_preview } => {
                 let tokens = usage.as_ref()
                     .map(|u| format!("↑{} ↓{}", u.input_tokens, u.output_tokens))
                     .unwrap_or_default();
                 let tools = if *has_tool_calls { " +tools" } else { "" };
-                let full = usage.as_ref()
-                    .map(|u| format!("input: {} tokens, output: {} tokens, tool_calls: {}", u.input_tokens, u.output_tokens, has_tool_calls))
+                let preview = content_preview.as_deref().unwrap_or("");
+                let preview_short = if preview.len() > 60 {
+                    format!("{}...", &preview[..preview.floor_char_boundary(60)])
+                } else {
+                    preview.to_string()
+                };
+                let mut full = usage.as_ref()
+                    .map(|u| format!("input: {} tokens, output: {} tokens\ntool_calls: {}", u.input_tokens, u.output_tokens, has_tool_calls))
                     .unwrap_or_default();
-                ("✓", "LLM done".into(), format!("{tokens}{tools}"), full)
+                if !preview.is_empty() {
+                    full.push_str(&format!("\nresponse: {preview}"));
+                }
+                ("✓", "LLM done".into(), format!("{tokens}{tools} {preview_short}"), full)
             }
             EventKind::ToolCallRequested { tool_name, arguments, call_id } => {
                 let args_short = if arguments.len() > 60 {

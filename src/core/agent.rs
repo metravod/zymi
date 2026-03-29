@@ -11,7 +11,7 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::core::approval::ApprovalHandler;
 use crate::core::langfuse::{self, LangfuseClient, TraceCtx};
 use crate::core::tool_selector::ToolSelector;
-use crate::core::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
+use crate::core::{ContentPart, LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
 use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
 use crate::events::{Event, EventKind};
@@ -27,6 +27,22 @@ fn truncate_for_log(s: &str, max: usize) -> String {
         let end = s.floor_char_boundary(max);
         format!("{}...", &s[..end])
     }
+}
+
+/// Rough estimate of context size in characters (for observability, not billing).
+fn estimate_context_chars(messages: &[Message]) -> usize {
+    messages.iter().map(|m| match m {
+        Message::System(s) | Message::User(s) => s.len(),
+        Message::UserMultimodal { parts } => parts.iter().map(|p| match p {
+            ContentPart::Text(t) => t.len(),
+            ContentPart::ImageBase64 { data, .. } => data.len(),
+        }).sum(),
+        Message::Assistant { content, tool_calls } => {
+            content.as_deref().map_or(0, str::len)
+                + tool_calls.iter().map(|tc| tc.name.len() + tc.arguments.len()).sum::<usize>()
+        }
+        Message::ToolResult { content, .. } => content.len(),
+    }).sum()
 }
 
 /// Build a dedup key for a tool call. For search tools, normalize the query
@@ -826,7 +842,11 @@ impl Agent {
         for iteration in 0..self.max_iterations {
             log::info!("Iteration {}/{}", iteration + 1, self.max_iterations);
 
-            self.emit_event(conversation_id, EventKind::LlmCallStarted { iteration });
+            self.emit_event(conversation_id, EventKind::LlmCallStarted {
+                iteration,
+                message_count: messages.len(),
+                approx_context_chars: estimate_context_chars(&messages),
+            });
 
             let llm_start = langfuse::timestamp();
             let response = self.chat_with_timeout(&messages, &tool_definitions).await?;
@@ -836,6 +856,7 @@ impl Agent {
             self.emit_event(conversation_id, EventKind::LlmCallCompleted {
                 has_tool_calls: !response.tool_calls.is_empty(),
                 usage: response.usage.clone(),
+                content_preview: response.content.as_deref().map(|c| truncate_for_log(c, 200)),
             });
 
             if response.tool_calls.is_empty() {
@@ -1025,7 +1046,11 @@ impl Agent {
             log::info!("Stream iteration {}/{}", iteration + 1, self.max_iterations);
             let _ = event_tx.send(StreamEvent::IterationStart(iteration));
 
-            self.emit_event(conversation_id, EventKind::LlmCallStarted { iteration });
+            self.emit_event(conversation_id, EventKind::LlmCallStarted {
+                iteration,
+                message_count: messages.len(),
+                approx_context_chars: estimate_context_chars(&messages),
+            });
 
             let max_reviews = self.monitor.as_ref().map_or(0, |m| m.max_reviews);
             let pending_review = monitor_reviews < max_reviews;
@@ -1043,6 +1068,7 @@ impl Agent {
             self.emit_event(conversation_id, EventKind::LlmCallCompleted {
                 has_tool_calls: !response.tool_calls.is_empty(),
                 usage: response.usage.clone(),
+                content_preview: response.content.as_deref().map(|c| truncate_for_log(c, 200)),
             });
 
             if let Some(ref usage) = response.usage {

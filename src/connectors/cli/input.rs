@@ -68,25 +68,32 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
 
     // Handle approval responses first
     if app.pending_approval.is_some() {
-        return match key.code {
+        match key.code {
             KeyCode::Left | KeyCode::Right => {
                 app.approval_selected = !app.approval_selected;
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Enter => {
                 app.handle_approval(app.approval_selected);
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.handle_approval(true);
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 app.handle_approval(false);
-                InputAction::None
+                return InputAction::None;
             }
-            _ => InputAction::None,
-        };
+            // Esc rejects (same as No)
+            KeyCode::Esc => {
+                app.handle_approval(false);
+                return InputAction::None;
+            }
+            // Allow panel toggles during approval
+            KeyCode::F(1) | KeyCode::F(2) => { /* fall through to global handlers */ }
+            _ => return InputAction::None,
+        }
     }
 
     // Handle pending question from agent (ask_user tool)
@@ -99,6 +106,13 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
                 }
                 return InputAction::None;
             }
+            // Esc cancels the question
+            KeyCode::Esc => {
+                app.handle_question_response("[cancelled by user]".to_string());
+                return InputAction::None;
+            }
+            // Allow panel toggles during question input
+            KeyCode::F(1) | KeyCode::F(2) => { /* fall through to global handlers */ }
             _ => {
                 app.input.input(event);
                 auto_wrap_input(&mut app.input, app.input_width as usize);

@@ -183,7 +183,7 @@ mod tests {
         for i in 0..5 {
             let event = Event::new(
                 "s1".into(),
-                EventKind::LlmCallStarted { iteration: i },
+                EventKind::LlmCallStarted { iteration: i, message_count: 0, approx_context_chars: 0 },
                 "agent".into(),
             );
             bus.publish(event).await.unwrap();
@@ -191,7 +191,7 @@ mod tests {
 
         for i in 0..5 {
             let received = rx.try_recv().unwrap();
-            if let EventKind::LlmCallStarted { iteration } = received.kind {
+            if let EventKind::LlmCallStarted { iteration, .. } = received.kind {
                 assert_eq!(iteration, i);
             } else {
                 panic!("unexpected event kind");
@@ -210,7 +210,7 @@ mod tests {
         for i in 0..5 {
             let event = Event::new(
                 "s1".into(),
-                EventKind::LlmCallStarted { iteration: i },
+                EventKind::LlmCallStarted { iteration: i, message_count: 0, approx_context_chars: 0 },
                 "agent".into(),
             );
             bus.publish(event).await.unwrap();

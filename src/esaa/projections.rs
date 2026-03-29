@@ -128,6 +128,7 @@ mod tests {
             EventKind::LlmCallCompleted {
                 has_tool_calls: false,
                 usage: None,
+                content_preview: None,
             },
         ));
 
@@ -173,6 +174,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 50,
                 }),
+                content_preview: None,
             },
         ));
 
@@ -204,6 +206,7 @@ mod tests {
                     input_tokens: 200,
                     output_tokens: 100,
                 }),
+                content_preview: Some("hello world".into()),
             },
         ));
 
@@ -240,6 +243,7 @@ mod tests {
                         input_tokens: 50,
                         output_tokens: 10,
                     }),
+                    content_preview: None,
                 },
             ),
             make_event(

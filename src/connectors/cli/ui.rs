@@ -114,10 +114,12 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
-    let logo = Style::default()
-        .fg(theme::SURFACE)
-        .bg(theme::ACCENT)
-        .add_modifier(Modifier::BOLD);
+    // Per-letter gradient styles (pink → purple → blue → teal)
+    let sz = Style::default().fg(theme::LOGO_Z).add_modifier(Modifier::BOLD);
+    let sy = Style::default().fg(theme::LOGO_Y).add_modifier(Modifier::BOLD);
+    let sm = Style::default().fg(theme::LOGO_M).add_modifier(Modifier::BOLD);
+    let si = Style::default().fg(theme::LOGO_I).add_modifier(Modifier::BOLD);
+
     let dim = Style::default().fg(theme::SUBTEXT);
     let bold = Style::default()
         .fg(theme::TEXT)
@@ -125,19 +127,28 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let pad = "  ";
 
-    //  Z     Y       M     I
+    //          Z              Y              M              I
     let line1 = Line::from(vec![
-        Span::styled(" ███████╗██╗   ██╗███╗   ███╗██╗", logo),
+        Span::styled(" ███████╗", sz),
+        Span::styled("██╗   ██╗", sy),
+        Span::styled("███╗   ███╗", sm),
+        Span::styled("██╗", si),
     ]);
 
     let line2 = Line::from(vec![
-        Span::styled(" ╚══███╔╝╚██╗ ██╔╝████╗ ████║██║", logo),
+        Span::styled(" ╚══███╔╝", sz),
+        Span::styled("╚██╗ ██╔╝", sy),
+        Span::styled("████╗ ████║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim),
     ]);
 
     let mut line3_spans = vec![
-        Span::styled("   ███╔╝  ╚████╔╝ ██╔████╔██║██║", logo),
+        Span::styled("   ███╔╝ ", sz),
+        Span::styled(" ╚████╔╝ ", sy),
+        Span::styled("██╔████╔██║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled("model: ", dim),
         Span::styled(model.to_string(), bold),
@@ -165,13 +176,19 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let line4 = Line::from(vec![
-        Span::styled("  ███╔╝    ╚██╔╝  ██║╚██╔╝██║██║", logo),
+        Span::styled("  ███╔╝  ", sz),
+        Span::styled("  ╚██╔╝  ", sy),
+        Span::styled("██║╚██╔╝██║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled(cwd, dim),
     ]);
 
     let line5 = Line::from(vec![
-        Span::styled(" ███████╗   ██║   ██║ ╚═╝ ██║██║", logo),
+        Span::styled(" ███████╗", sz),
+        Span::styled("   ██║   ", sy),
+        Span::styled("██║ ╚═╝ ██║", sm),
+        Span::styled("██║", si),
     ]);
 
     let block = Block::default()
@@ -179,12 +196,14 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
         .border_style(Style::default().fg(theme::BORDER));
 
     let line6 = Line::from(vec![
-        Span::styled(" ╚══════╝   ╚═╝   ╚═╝     ╚═╝╚═╝", logo),
+        Span::styled(" ╚══════╝", sz),
+        Span::styled("   ╚═╝   ", sy),
+        Span::styled("╚═╝     ╚═╝", sm),
+        Span::styled("╚═╝", si),
     ]);
 
     let header_widget = Paragraph::new(vec![line1, line2, line3, line4, line5, line6])
-        .block(block)
-        .style(Style::default().bg(theme::SURFACE));
+        .block(block);
 
     f.render_widget(header_widget, area);
 }

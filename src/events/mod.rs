@@ -89,10 +89,13 @@ pub enum EventKind {
     },
     LlmCallStarted {
         iteration: usize,
+        message_count: usize,
+        approx_context_chars: usize,
     },
     LlmCallCompleted {
         has_tool_calls: bool,
         usage: Option<TokenUsage>,
+        content_preview: Option<String>,
     },
 
     // -- Tool lifecycle --

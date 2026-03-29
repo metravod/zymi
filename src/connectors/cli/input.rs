@@ -200,6 +200,12 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             KeyCode::Enter => {
                 match app.left_panel_section {
                     LeftPanelSection::Models => {
+                        // Last entry is "+ Add model"
+                        if app.left_panel_index == app.available_models.len() {
+                            app.left_panel_focused = false;
+                            app.add_model_form = Some(AddModelForm::new());
+                            return InputAction::None;
+                        }
                         if let Some(model) = app.available_models.get(app.left_panel_index) {
                             let mid = model.id.clone();
                             if mid != app.current_model_id {
@@ -216,6 +222,10 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
                         }
                     }
                 }
+            }
+            // Q quits from sidebar
+            KeyCode::Char('q') if !app.is_processing => {
+                InputAction::Quit
             }
             KeyCode::Esc | KeyCode::F(1) => {
                 app.left_panel_focused = false;
@@ -322,10 +332,6 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             } else {
                 InputAction::None
             }
-        }
-        // Q quits (only when input is empty and not processing)
-        KeyCode::Char('q') if key.modifiers.is_empty() && app.input.lines().join("").trim().is_empty() && !app.is_processing => {
-            InputAction::Quit
         }
         KeyCode::Enter => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {

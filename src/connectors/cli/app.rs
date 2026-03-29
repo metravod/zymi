@@ -635,7 +635,7 @@ impl App {
     /// Number of items in the currently focused left panel section.
     pub fn left_panel_section_len(&self) -> usize {
         match self.left_panel_section {
-            LeftPanelSection::Models => self.available_models.len(),
+            LeftPanelSection::Models => self.available_models.len() + 1, // +1 for "+ Add model"
             LeftPanelSection::SystemFiles => self.system_files.len(),
             LeftPanelSection::SubAgents => self.subagent_files.len(),
         }

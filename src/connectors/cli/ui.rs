@@ -846,6 +846,15 @@ fn draw_left_panel(f: &mut Frame, app: &App, area: Rect) {
         let name = truncate_str(&format!("{}{}", marker, model.name), models_inner.width as usize);
         model_lines.push(Line::from(Span::styled(name, style)));
     }
+    // "+ Add model" entry
+    let add_idx = app.available_models.len();
+    let is_add_selected = models_focused && app.left_panel_index == add_idx;
+    let add_style = if is_add_selected {
+        Style::default().fg(theme::SURFACE).bg(theme::SUCCESS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::SUCCESS)
+    };
+    model_lines.push(Line::from(Span::styled("  + Add model", add_style)));
     f.render_widget(Paragraph::new(model_lines), models_inner);
 
     // -- System Files block --
@@ -1025,6 +1034,7 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("\u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
             Span::styled("Enter", key_style), Span::styled(":Select ", dim),
             Span::styled("\u{2192}", key_style), Span::styled(":Chat ", dim),
+            Span::styled("Q", key_style), Span::styled(":Quit ", dim),
             Span::styled("F1", key_style), Span::styled(":Hide ", dim),
         ]
     } else {
@@ -1054,7 +1064,7 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" ^M", key_style), Span::styled(":Model ", dim),
             Span::styled("^Y", key_style), Span::styled(":Copy ", dim),
             Span::styled("Esc", key_style), Span::styled(":Stop ", dim),
-            Span::styled("Q", key_style), Span::styled(":Quit", dim),
+            Span::styled("/quit", key_style), Span::styled(":Quit", dim),
         ]);
         h
     };

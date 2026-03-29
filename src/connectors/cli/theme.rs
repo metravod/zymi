@@ -13,3 +13,9 @@ pub const ERROR: Color = Color::Rgb(243, 139, 168); // red
 pub const TOOL: Color = Color::Rgb(203, 166, 247); // mauve
 pub const BORDER: Color = Color::Rgb(88, 91, 112);
 pub const DEBUG: Color = Color::Rgb(180, 142, 173);
+
+// Logo gradient (pink → purple → blue → teal)
+pub const LOGO_Z: Color = Color::Rgb(244, 114, 182);
+pub const LOGO_Y: Color = Color::Rgb(192, 132, 252);
+pub const LOGO_M: Color = Color::Rgb(96, 165, 250);
+pub const LOGO_I: Color = Color::Rgb(45, 212, 191);

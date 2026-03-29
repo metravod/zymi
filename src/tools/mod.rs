@@ -20,6 +20,7 @@ pub mod youtube_transcript;
 use async_trait::async_trait;
 
 use crate::core::ToolDefinition;
+use crate::esaa::Intention;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -38,5 +39,11 @@ pub trait Tool: Send + Sync {
 
     fn format_approval_request(&self, arguments: &str) -> String {
         format!("Tool: {}\nArguments: {}", self.definition().name, arguments)
+    }
+
+    /// Convert a tool call into an ESAA Intention for orchestrator evaluation.
+    /// Returns None for tools that haven't been migrated to the intention model yet.
+    fn to_intention(&self, _arguments: &str) -> Option<Intention> {
+        None
     }
 }

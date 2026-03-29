@@ -1,8 +1,12 @@
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
+
 use tokio::sync::oneshot;
 use tui_textarea::TextArea;
 
 use crate::core::debug_provider::DebugEvent;
 use crate::core::StreamEvent;
+use crate::events::{Event, EventKind};
 
 pub const PROVIDER_OPTIONS: &[&str] = &["OpenAI Compatible", "Anthropic", "ChatGPT Plus (OAuth)"];
 
@@ -61,6 +65,41 @@ impl Default for UsageStats {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum LeftPanelSection {
+    Models,
+    SystemFiles,
+    SubAgents,
+}
+
+impl LeftPanelSection {
+    pub fn next(&self) -> Self {
+        match self {
+            LeftPanelSection::Models => LeftPanelSection::SystemFiles,
+            LeftPanelSection::SystemFiles => LeftPanelSection::SubAgents,
+            LeftPanelSection::SubAgents => LeftPanelSection::Models,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            LeftPanelSection::Models => LeftPanelSection::SubAgents,
+            LeftPanelSection::SystemFiles => LeftPanelSection::Models,
+            LeftPanelSection::SubAgents => LeftPanelSection::SystemFiles,
+        }
+    }
+}
+
+pub struct ObservabilityEntry {
+    pub timestamp: String,
+    pub icon: &'static str,
+    pub kind: String,
+    pub detail: String,
+    pub full_detail: String, // untruncated for expand view
+}
+
+const MAX_OBSERVABILITY_ENTRIES: usize = 500;
+
 pub struct App {
     pub messages: Vec<ChatEntry>,
     pub input: TextArea<'static>,
@@ -86,6 +125,24 @@ pub struct App {
     pub usage: UsageStats,
     pub input_price_per_1m: Option<f64>,
     pub output_price_per_1m: Option<f64>,
+    // -- Panel state --
+    pub left_panel_visible: bool,
+    pub right_panel_visible: bool,
+    pub left_panel_focused: bool,
+    pub left_panel_section: LeftPanelSection,
+    pub left_panel_index: usize,
+    pub right_panel_events: VecDeque<ObservabilityEntry>,
+    pub right_panel_scroll: u16,
+    pub right_panel_auto_scroll: bool,
+    pub right_panel_total_lines: u16,
+    pub right_panel_visible_height: u16,
+    pub right_panel_x_range: (u16, u16), // (x_start, x_end) for mouse hit-test
+    pub right_panel_focused: bool,
+    pub right_panel_selected: usize,
+    pub right_panel_expanded: HashSet<usize>, // indices of expanded events
+    pub system_files: Vec<String>,
+    pub subagent_files: Vec<String>,
+    pub memory_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -134,10 +191,25 @@ impl App {
         debug_mode: bool,
         input_price_per_1m: Option<f64>,
         output_price_per_1m: Option<f64>,
+        memory_dir: PathBuf,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
-        input.set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
+        input.set_placeholder_text("Type your message... (Enter to send, Q to quit)");
+
+        // Scan for system files and subagents
+        let system_files = vec!["AGENT.md".to_string()];
+        let subagent_dir = memory_dir.join("subagents");
+        let subagent_files = std::fs::read_dir(&subagent_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Self {
             messages: Vec::new(),
@@ -164,6 +236,23 @@ impl App {
             usage: UsageStats::default(),
             input_price_per_1m,
             output_price_per_1m,
+            left_panel_visible: true,
+            right_panel_visible: true,
+            left_panel_focused: false,
+            left_panel_section: LeftPanelSection::Models,
+            left_panel_index: 0,
+            right_panel_events: VecDeque::new(),
+            right_panel_scroll: 0,
+            right_panel_auto_scroll: true,
+            right_panel_total_lines: 0,
+            right_panel_visible_height: 0,
+            right_panel_x_range: (0, 0),
+            right_panel_focused: false,
+            right_panel_selected: 0,
+            right_panel_expanded: HashSet::new(),
+            system_files,
+            subagent_files,
+            memory_dir,
         }
     }
 
@@ -415,8 +504,156 @@ impl App {
         self.input = TextArea::default();
         self.input.set_cursor_line_style(ratatui::style::Style::default());
         self.input
-            .set_placeholder_text("Type your message... (Enter to send, Esc to quit)");
+            .set_placeholder_text("Type your message... (Enter to send, Q to quit)");
         text
+    }
+
+    pub fn handle_domain_event(&mut self, event: Event) {
+        let ts = event.timestamp.format("%H:%M:%S").to_string();
+        let (icon, kind, detail, full_detail) = match &event.kind {
+            EventKind::AgentProcessingStarted { conversation_id } => (
+                "▶", "Processing".into(), String::new(), format!("conversation: {conversation_id}"),
+            ),
+            EventKind::AgentProcessingCompleted { success, conversation_id } => (
+                if *success { "✓" } else { "✗" },
+                "Completed".into(),
+                if *success { String::new() } else { "with errors".into() },
+                format!("conversation: {conversation_id}, success: {success}"),
+            ),
+            EventKind::LlmCallStarted { iteration, message_count, approx_context_chars } => {
+                let ctx_k = *approx_context_chars / 1024;
+                (
+                    "⚡", "LLM call".into(),
+                    format!("iter {} | {}msg ~{}k", iteration + 1, message_count, ctx_k),
+                    format!("iteration: {}\nmessages: {}\napprox context: {} chars (~{}k)", iteration + 1, message_count, approx_context_chars, ctx_k),
+                )
+            }
+            EventKind::LlmCallCompleted { has_tool_calls, usage, content_preview } => {
+                let tokens = usage.as_ref()
+                    .map(|u| format!("↑{} ↓{}", u.input_tokens, u.output_tokens))
+                    .unwrap_or_default();
+                let tools = if *has_tool_calls { " +tools" } else { "" };
+                let preview = content_preview.as_deref().unwrap_or("");
+                let preview_short = if preview.len() > 60 {
+                    format!("{}...", &preview[..preview.floor_char_boundary(60)])
+                } else {
+                    preview.to_string()
+                };
+                let mut full = usage.as_ref()
+                    .map(|u| format!("input: {} tokens, output: {} tokens\ntool_calls: {}", u.input_tokens, u.output_tokens, has_tool_calls))
+                    .unwrap_or_default();
+                if !preview.is_empty() {
+                    full.push_str(&format!("\nresponse: {preview}"));
+                }
+                ("✓", "LLM done".into(), format!("{tokens}{tools} {preview_short}"), full)
+            }
+            EventKind::ToolCallRequested { tool_name, arguments, call_id } => {
+                let args_short = if arguments.len() > 60 {
+                    format!("{}...", &arguments[..arguments.floor_char_boundary(60)])
+                } else {
+                    arguments.clone()
+                };
+                let full = format!("call_id: {call_id}\ntool: {tool_name}\nargs: {arguments}");
+                ("🔧", format!("Tool: {tool_name}"), args_short, full)
+            }
+            EventKind::ToolCallCompleted { call_id, result_preview, is_error, duration_ms } => {
+                let icon = if *is_error { "✗" } else { "✓" };
+                let preview = if result_preview.len() > 60 {
+                    format!("{}...", &result_preview[..result_preview.floor_char_boundary(60)])
+                } else {
+                    result_preview.clone()
+                };
+                let full = format!("call_id: {call_id}\nduration: {duration_ms}ms\nerror: {is_error}\nresult: {result_preview}");
+                (icon, "Tool done".into(), format!("{preview} ({duration_ms}ms)"), full)
+            }
+            EventKind::IntentionEmitted { intention_tag, intention_data } => (
+                "📋", "Intention".into(), intention_tag.clone(),
+                format!("tag: {intention_tag}\ndata: {intention_data}"),
+            ),
+            EventKind::IntentionEvaluated { intention_tag, verdict } => (
+                "📝", "Contract".into(), format!("{intention_tag}: {verdict}"),
+                format!("tag: {intention_tag}\nverdict: {verdict}"),
+            ),
+            EventKind::ApprovalRequested { description, approval_id } => (
+                "⚠", "Approval".into(), description.clone(),
+                format!("id: {approval_id}\n{description}"),
+            ),
+            EventKind::ApprovalDecided { approved, approval_id } => (
+                if *approved { "✓" } else { "✗" },
+                "Decision".into(),
+                if *approved { "approved".into() } else { "rejected".into() },
+                format!("id: {approval_id}, approved: {approved}"),
+            ),
+            EventKind::ResponseReady { conversation_id, content } => {
+                let preview = if content.len() > 80 {
+                    format!("{}...", &content[..content.floor_char_boundary(80)])
+                } else {
+                    content.clone()
+                };
+                ("📨", "Response".into(), preview, format!("conversation: {conversation_id}\n{content}"))
+            }
+            EventKind::WorkflowStarted { node_count, user_message } => (
+                "🔀", "Workflow".into(), format!("{node_count} nodes"),
+                format!("nodes: {node_count}\nmessage: {user_message}"),
+            ),
+            EventKind::WorkflowNodeStarted { node_id, description } => (
+                "▶", format!("WF:{node_id}"), description.clone(),
+                format!("node: {node_id}\n{description}"),
+            ),
+            EventKind::WorkflowNodeCompleted { node_id, success } => (
+                if *success { "✓" } else { "✗" },
+                format!("WF:{node_id}"), String::new(),
+                format!("node: {node_id}, success: {success}"),
+            ),
+            EventKind::WorkflowCompleted { success } => (
+                if *success { "✓" } else { "✗" },
+                "WF done".into(), String::new(),
+                format!("success: {success}"),
+            ),
+            _ => return, // Skip UserMessageReceived, ScheduledTaskTriggered
+        };
+
+        self.right_panel_events.push_back(ObservabilityEntry {
+            timestamp: ts,
+            icon,
+            kind,
+            detail,
+            full_detail,
+        });
+
+        // Cap at MAX_OBSERVABILITY_ENTRIES
+        while self.right_panel_events.len() > MAX_OBSERVABILITY_ENTRIES {
+            self.right_panel_events.pop_front();
+        }
+
+        // Reset scroll to bottom on new events (if user hasn't scrolled up)
+        if self.right_panel_auto_scroll {
+            self.right_panel_scroll = 0;
+        }
+    }
+
+    /// Number of items in the currently focused left panel section.
+    pub fn left_panel_section_len(&self) -> usize {
+        match self.left_panel_section {
+            LeftPanelSection::Models => self.available_models.len() + 1, // +1 for "+ Add model"
+            LeftPanelSection::SystemFiles => self.system_files.len(),
+            LeftPanelSection::SubAgents => self.subagent_files.len(),
+        }
+    }
+
+    /// Get the file path for the selected item in the left panel (for opening in editor).
+    pub fn left_panel_selected_path(&self) -> Option<PathBuf> {
+        match self.left_panel_section {
+            LeftPanelSection::Models => None, // Models are switched, not opened
+            LeftPanelSection::SystemFiles => {
+                self.system_files.get(self.left_panel_index)
+                    .map(|f| self.memory_dir.join(f))
+            }
+            LeftPanelSection::SubAgents => {
+                self.subagent_files.get(self.left_panel_index)
+                    .map(|f| self.memory_dir.join("subagents").join(f))
+            }
+        }
     }
 
     pub fn handle_command(&mut self, cmd: &str) -> bool {

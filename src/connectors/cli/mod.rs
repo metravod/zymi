@@ -18,13 +18,15 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use crate::core::agent::Agent;
 use crate::core::approval::{ApprovalSlotGuard, SharedApprovalHandler};
 use crate::core::config::{ModelEntry, ModelsConfig, ProviderType};
 use crate::core::debug_provider::DebugEvent;
 use crate::core::provider_manager::ProviderManager;
 use crate::core::StreamEvent;
+use crate::events::bus::EventBus;
+use crate::events::connector::EventDrivenConnector;
 use crate::setup;
 
 use app::App;
@@ -51,13 +53,16 @@ fn disable_mouse_scroll() {
     let _ = stdout.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    agent: Arc<Agent>,
+    connector: Arc<EventDrivenConnector>,
+    event_bus: Arc<EventBus>,
     provider_manager: Arc<ProviderManager>,
     shared_approval: SharedApprovalHandler,
     mut debug_rx: mpsc::UnboundedReceiver<DebugEvent>,
     models_config: &ModelsConfig,
     mut ask_user_rx: mpsc::UnboundedReceiver<crate::tools::ask_user::UserQuestion>,
+    memory_dir: std::path::PathBuf,
 ) {
     // Setup terminal
     enable_raw_mode().expect("Failed to enable raw mode");
@@ -106,6 +111,7 @@ pub async fn run(
         debug_mode,
         input_price,
         output_price,
+        memory_dir,
     );
 
     // Channel for stream events from agent
@@ -114,11 +120,17 @@ pub async fn run(
     // Channel for approval events
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<AppEvent>();
 
+    // EventBus subscriber for right panel (observability)
+    let mut domain_rx = event_bus.subscribe_with_capacity(1024).await;
+
     // Crossterm event stream
     let mut reader = EventStream::new();
 
     // Tick interval for spinner
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+
+    // Track current agent task so we can abort on Esc
+    let mut agent_task: Option<JoinHandle<()>> = None;
 
     loop {
         // Draw UI
@@ -140,27 +152,28 @@ pub async fn run(
                             app.is_processing = true;
                             app.scroll_to_bottom();
 
-                            let agent = agent.clone();
+                            let connector = connector.clone();
                             let conv_id = app.conversation_id.clone();
                             let tx = stream_tx.clone();
                             let approval_tx = approval_tx.clone();
                             let shared_approval = shared_approval.clone();
 
-                            tokio::spawn(async move {
+                            agent_task = Some(tokio::spawn(async move {
                                 let approval_handler: Arc<dyn crate::core::approval::ApprovalHandler> =
                                     Arc::new(CliApprovalHandler::new(approval_tx));
 
                                 let _guard = ApprovalSlotGuard::set(
                                     shared_approval,
-                                    approval_handler.clone(),
+                                    approval_handler,
                                 )
                                 .await;
 
-                                let result = agent
-                                    .process_stream(
+                                let result = connector
+                                    .submit_and_wait_streaming(
                                         &conv_id,
-                                        &text,
-                                        Some(approval_handler.as_ref()),
+                                        crate::core::Message::User(text),
+                                        "cli",
+                                        Duration::from_secs(600),
                                         tx.clone(),
                                     )
                                     .await;
@@ -168,7 +181,20 @@ pub async fn run(
                                 if let Err(e) = result {
                                     let _ = tx.send(StreamEvent::Error(e.to_string()));
                                 }
-                            });
+                            }));
+                        }
+                        InputAction::Interrupt => {
+                            if let Some(handle) = agent_task.take() {
+                                handle.abort();
+                            }
+                            app.is_processing = false;
+                            app.pending_approval = None;
+                            app.messages.push(app::ChatEntry::SystemMessage(
+                                "Interrupted.".to_string(),
+                            ));
+                            if app.auto_scroll {
+                                app.scroll_to_bottom();
+                            }
                         }
                         InputAction::AddModel(info) => {
                             let provider = match info.provider_index {
@@ -283,6 +309,42 @@ pub async fn run(
                                 }
                             }
                         }
+                        InputAction::OpenEditor(path) => {
+                            // Leave alternate screen for external editor
+                            disable_mouse_scroll();
+                            let _ = disable_raw_mode();
+                            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+
+                            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+                            let status = std::process::Command::new(&editor)
+                                .arg(&path)
+                                .status();
+
+                            // Re-enter alternate screen
+                            let _ = enable_raw_mode();
+                            let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+                            enable_mouse_scroll();
+                            terminal.clear().ok();
+
+                            if let Err(e) = status {
+                                app.messages.push(app::ChatEntry::SystemMessage(
+                                    format!("Failed to open editor: {e}"),
+                                ));
+                            }
+
+                            // Rescan subagents in case user created/edited one
+                            let subagent_dir = app.memory_dir.join("subagents");
+                            app.subagent_files = std::fs::read_dir(&subagent_dir)
+                                .ok()
+                                .map(|entries| {
+                                    entries
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                                        .filter_map(|e| e.file_name().into_string().ok())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        }
                         InputAction::ToggleCopyMode => {
                             app.copy_mode = !app.copy_mode;
                             if app.copy_mode {
@@ -331,6 +393,10 @@ pub async fn run(
                     responder: q.responder,
                 });
                 app.scroll_to_bottom();
+            }
+            // Domain events for right panel (observability)
+            Some(event) = domain_rx.recv() => {
+                app.handle_domain_event(event);
             }
             // Debug events
             Some(event) = debug_rx.recv() => {

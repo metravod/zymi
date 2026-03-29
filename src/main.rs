@@ -3,7 +3,9 @@ mod auth;
 mod connectors;
 mod core;
 mod daemon;
+mod esaa;
 mod eval;
+mod events;
 mod git_sync;
 mod mcp;
 mod policy;
@@ -281,6 +283,8 @@ struct App {
     policy_engine: Arc<policy::PolicyEngine>,
     audit_log: audit::AuditLog,
     sandbox: Arc<sandbox::SandboxManager>,
+    event_bus: Arc<events::bus::EventBus>,
+    stream_registry: Arc<events::stream_registry::StreamRegistry>,
 }
 
 async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
@@ -296,6 +300,14 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         SqliteStorage::new(&db_path)
             .with_context(|| format!("Failed to open SQLite database: {}", db_path.display()))?,
     );
+
+    // Event store + bus (EDA foundation)
+    let event_store = Arc::new(
+        events::store::SqliteEventStore::new(&db_path)
+            .with_context(|| "Failed to initialize event store")?,
+    );
+    let event_bus = Arc::new(events::bus::EventBus::new(event_store));
+    let stream_registry = Arc::new(events::stream_registry::StreamRegistry::new());
 
     let agent_prompt_path = memory_dir.join("AGENT.md");
     let system_prompt = std::fs::read_to_string(&agent_prompt_path).unwrap_or_else(|e| {
@@ -488,6 +500,23 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         agent_builder = agent_builder.with_langfuse(lf.clone(), default_model_id);
     }
 
+    agent_builder = agent_builder.with_event_bus(event_bus.clone());
+
+    // ESAA: Orchestrator routes tool calls through boundary contracts
+    let file_contract = esaa::contracts::FileWriteContract {
+        allowed_dirs: vec!["./memory/".into(), "/tmp/".into()],
+        deny_patterns: vec!["*.env".into(), "*.key".into(), "*.pem".into()],
+    };
+    let contract_engine = Arc::new(esaa::contracts::ContractEngine::new(
+        policy_engine.clone(),
+        file_contract,
+    ));
+    let orchestrator = Arc::new(esaa::orchestrator::Orchestrator::new(
+        contract_engine,
+        event_bus.clone(),
+    ));
+    agent_builder = agent_builder.with_orchestrator(orchestrator);
+
     let agent = Arc::new(agent_builder);
 
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -509,6 +538,8 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         policy_engine,
         audit_log,
         sandbox: sandbox_manager,
+        event_bus,
+        stream_registry,
     })
 }
 
@@ -649,6 +680,22 @@ async fn main() -> Result<()> {
         bg_handles.push(lf.start_flushing(app.shutdown.clone()));
     }
 
+    // Agent worker: consumes inbound events, drives agent, publishes responses
+    let agent_worker = Arc::new(events::agent_worker::AgentWorker::new(
+        app.agent.clone(),
+        app.event_bus.clone(),
+        app.shared_approval_handler.clone(),
+        app.stream_registry.clone(),
+    ));
+    bg_handles.push(tokio::spawn(async move { agent_worker.run().await }));
+
+    // Audit projection: subscribes to event bus, writes audit log entries
+    let audit_projection = audit::AuditProjection::new(
+        app.event_bus.clone(),
+        app.audit_log.clone(),
+    );
+    bg_handles.push(tokio::spawn(audit_projection.run()));
+
     // Destructure what we need before moving into connector
     let shutdown = app.shutdown.clone();
     let git_sync = app.git_sync.clone();
@@ -656,13 +703,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Cli) => {
+            let cli_connector = Arc::new(events::connector::EventDrivenConnector::new(
+                app.event_bus.clone(),
+                app.stream_registry.clone(),
+            ));
             connectors::cli::run(
-                app.agent,
+                cli_connector,
+                app.event_bus.clone(),
                 app.provider_manager,
                 app.shared_approval_handler,
                 app.debug_rx,
                 &app.models_config,
                 app.ask_user_rx,
+                app.memory_dir.clone(),
             )
             .await;
         }
@@ -700,6 +753,8 @@ async fn main() -> Result<()> {
                     app.provider_manager,
                     app.shared_approval_handler,
                     app.ask_user_rx,
+                    app.event_bus.clone(),
+                    app.stream_registry.clone(),
                 )
                 .await;
             } else {

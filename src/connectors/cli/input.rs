@@ -1,7 +1,9 @@
+use std::path::PathBuf;
+
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use tui_textarea::{CursorMove, TextArea};
 
-use super::app::{AddModelForm, AddModelStep, App, PROVIDER_OPTIONS};
+use super::app::{AddModelForm, AddModelStep, App, LeftPanelSection, PROVIDER_OPTIONS};
 
 pub struct NewModelInfo {
     pub provider_index: usize,
@@ -16,7 +18,9 @@ pub enum InputAction {
     SendMessage(String),
     SwitchModel(String),
     AddModel(NewModelInfo),
+    OpenEditor(PathBuf),
     ToggleCopyMode,
+    Interrupt,
     Quit,
     None,
 }
@@ -24,13 +28,33 @@ pub enum InputAction {
 pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     // Handle mouse events
     if let Event::Mouse(mouse) = &event {
+        let in_right_panel = app.right_panel_visible
+            && mouse.column >= app.right_panel_x_range.0
+            && mouse.column < app.right_panel_x_range.1;
+
         return match mouse.kind {
             MouseEventKind::ScrollUp => {
-                app.scroll_up(3);
+                if in_right_panel {
+                    app.right_panel_scroll = app.right_panel_scroll.saturating_add(3);
+                    let max = app.right_panel_total_lines.saturating_sub(app.right_panel_visible_height);
+                    if app.right_panel_scroll > max {
+                        app.right_panel_scroll = max;
+                    }
+                    app.right_panel_auto_scroll = false;
+                } else {
+                    app.scroll_up(3);
+                }
                 InputAction::None
             }
             MouseEventKind::ScrollDown => {
-                app.scroll_down(3);
+                if in_right_panel {
+                    app.right_panel_scroll = app.right_panel_scroll.saturating_sub(3);
+                    if app.right_panel_scroll == 0 {
+                        app.right_panel_auto_scroll = true;
+                    }
+                } else {
+                    app.scroll_down(3);
+                }
                 InputAction::None
             }
             _ => InputAction::None,
@@ -44,25 +68,32 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
 
     // Handle approval responses first
     if app.pending_approval.is_some() {
-        return match key.code {
+        match key.code {
             KeyCode::Left | KeyCode::Right => {
                 app.approval_selected = !app.approval_selected;
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Enter => {
                 app.handle_approval(app.approval_selected);
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.handle_approval(true);
-                InputAction::None
+                return InputAction::None;
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 app.handle_approval(false);
-                InputAction::None
+                return InputAction::None;
             }
-            _ => InputAction::None,
-        };
+            // Esc rejects (same as No)
+            KeyCode::Esc => {
+                app.handle_approval(false);
+                return InputAction::None;
+            }
+            // Allow panel toggles during approval
+            KeyCode::F(1) | KeyCode::F(2) => { /* fall through to global handlers */ }
+            _ => return InputAction::None,
+        }
     }
 
     // Handle pending question from agent (ask_user tool)
@@ -75,6 +106,13 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
                 }
                 return InputAction::None;
             }
+            // Esc cancels the question
+            KeyCode::Esc => {
+                app.handle_question_response("[cancelled by user]".to_string());
+                return InputAction::None;
+            }
+            // Allow panel toggles during question input
+            KeyCode::F(1) | KeyCode::F(2) => { /* fall through to global handlers */ }
             _ => {
                 app.input.input(event);
                 auto_wrap_input(&mut app.input, app.input_width as usize);
@@ -126,7 +164,150 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         };
     }
 
+    // Left panel navigation when focused
+    if app.left_panel_focused && app.left_panel_visible {
+        return match key.code {
+            // Up/Down navigates items within the current section
+            KeyCode::Up => {
+                if app.left_panel_index > 0 {
+                    app.left_panel_index -= 1;
+                }
+                InputAction::None
+            }
+            KeyCode::Down => {
+                let max = app.left_panel_section_len().saturating_sub(1);
+                if app.left_panel_index < max {
+                    app.left_panel_index += 1;
+                }
+                InputAction::None
+            }
+            // Tab/BackTab switches between sections (Models / Files / SubAgents)
+            KeyCode::Tab => {
+                app.left_panel_section = app.left_panel_section.next();
+                app.left_panel_index = 0;
+                InputAction::None
+            }
+            KeyCode::BackTab => {
+                app.left_panel_section = app.left_panel_section.prev();
+                app.left_panel_index = 0;
+                InputAction::None
+            }
+            // Right arrow moves focus to chat
+            KeyCode::Right => {
+                app.left_panel_focused = false;
+                InputAction::None
+            }
+            KeyCode::Enter => {
+                match app.left_panel_section {
+                    LeftPanelSection::Models => {
+                        // Last entry is "+ Add model"
+                        if app.left_panel_index == app.available_models.len() {
+                            app.left_panel_focused = false;
+                            app.add_model_form = Some(AddModelForm::new());
+                            return InputAction::None;
+                        }
+                        if let Some(model) = app.available_models.get(app.left_panel_index) {
+                            let mid = model.id.clone();
+                            if mid != app.current_model_id {
+                                return InputAction::SwitchModel(mid);
+                            }
+                        }
+                        InputAction::None
+                    }
+                    LeftPanelSection::SystemFiles | LeftPanelSection::SubAgents => {
+                        if let Some(path) = app.left_panel_selected_path() {
+                            InputAction::OpenEditor(path)
+                        } else {
+                            InputAction::None
+                        }
+                    }
+                }
+            }
+            // Q quits from sidebar
+            KeyCode::Char('q') if !app.is_processing => {
+                InputAction::Quit
+            }
+            KeyCode::Esc | KeyCode::F(1) => {
+                app.left_panel_focused = false;
+                InputAction::None
+            }
+            _ => InputAction::None,
+        };
+    }
+
+    // Right panel navigation when focused
+    if app.right_panel_focused && app.right_panel_visible {
+        return match key.code {
+            KeyCode::Up => {
+                if app.right_panel_selected > 0 {
+                    app.right_panel_selected -= 1;
+                    app.right_panel_auto_scroll = false;
+                }
+                InputAction::None
+            }
+            KeyCode::Down => {
+                let max = app.right_panel_events.len().saturating_sub(1);
+                if app.right_panel_selected < max {
+                    app.right_panel_selected += 1;
+                }
+                InputAction::None
+            }
+            KeyCode::Enter => {
+                let idx = app.right_panel_selected;
+                if app.right_panel_expanded.contains(&idx) {
+                    app.right_panel_expanded.remove(&idx);
+                } else {
+                    app.right_panel_expanded.insert(idx);
+                }
+                InputAction::None
+            }
+            KeyCode::Left => {
+                app.right_panel_focused = false;
+                InputAction::None
+            }
+            KeyCode::Esc | KeyCode::F(2) => {
+                app.right_panel_focused = false;
+                InputAction::None
+            }
+            _ => InputAction::None,
+        };
+    }
+
     match key.code {
+        // Left arrow: focus left panel (if visible)
+        KeyCode::Left if app.left_panel_visible && !app.left_panel_focused && key.modifiers.is_empty() => {
+            app.left_panel_focused = true;
+            app.right_panel_focused = false;
+            InputAction::None
+        }
+        // F1 toggles left panel
+        KeyCode::F(1) => {
+            app.left_panel_visible = !app.left_panel_visible;
+            app.left_panel_focused = app.left_panel_visible;
+            InputAction::None
+        }
+        // F2 toggles right panel + focus
+        KeyCode::F(2) => {
+            if app.right_panel_focused {
+                app.right_panel_focused = false;
+                app.right_panel_visible = false;
+            } else if app.right_panel_visible {
+                app.right_panel_focused = true;
+                // Jump selection to last event
+                app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
+            } else {
+                app.right_panel_visible = true;
+                app.right_panel_focused = true;
+                app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
+            }
+            InputAction::None
+        }
+        // Right arrow: focus right panel (if visible and not in left panel)
+        KeyCode::Right if app.right_panel_visible && !app.right_panel_focused && !app.left_panel_focused && key.modifiers.is_empty() => {
+            app.right_panel_focused = true;
+            app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
+            InputAction::None
+        }
         // Ctrl+Y toggles copy mode (disables mouse capture for text selection)
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             InputAction::ToggleCopyMode
@@ -144,7 +325,14 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             }
             InputAction::None
         }
-        KeyCode::Esc => InputAction::Quit,
+        // Esc interrupts agent processing
+        KeyCode::Esc => {
+            if app.is_processing {
+                InputAction::Interrupt
+            } else {
+                InputAction::None
+            }
+        }
         KeyCode::Enter => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.input.insert_newline();

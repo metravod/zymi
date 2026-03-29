@@ -28,13 +28,33 @@ pub enum InputAction {
 pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     // Handle mouse events
     if let Event::Mouse(mouse) = &event {
+        let in_right_panel = app.right_panel_visible
+            && mouse.column >= app.right_panel_x_range.0
+            && mouse.column < app.right_panel_x_range.1;
+
         return match mouse.kind {
             MouseEventKind::ScrollUp => {
-                app.scroll_up(3);
+                if in_right_panel {
+                    app.right_panel_scroll = app.right_panel_scroll.saturating_add(3);
+                    let max = app.right_panel_total_lines.saturating_sub(app.right_panel_visible_height);
+                    if app.right_panel_scroll > max {
+                        app.right_panel_scroll = max;
+                    }
+                    app.right_panel_auto_scroll = false;
+                } else {
+                    app.scroll_up(3);
+                }
                 InputAction::None
             }
             MouseEventKind::ScrollDown => {
-                app.scroll_down(3);
+                if in_right_panel {
+                    app.right_panel_scroll = app.right_panel_scroll.saturating_sub(3);
+                    if app.right_panel_scroll == 0 {
+                        app.right_panel_auto_scroll = true;
+                    }
+                } else {
+                    app.scroll_down(3);
+                }
                 InputAction::None
             }
             _ => InputAction::None,
@@ -191,10 +211,49 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         };
     }
 
+    // Right panel navigation when focused
+    if app.right_panel_focused && app.right_panel_visible {
+        return match key.code {
+            KeyCode::Up => {
+                if app.right_panel_selected > 0 {
+                    app.right_panel_selected -= 1;
+                    app.right_panel_auto_scroll = false;
+                }
+                InputAction::None
+            }
+            KeyCode::Down => {
+                let max = app.right_panel_events.len().saturating_sub(1);
+                if app.right_panel_selected < max {
+                    app.right_panel_selected += 1;
+                }
+                InputAction::None
+            }
+            KeyCode::Enter => {
+                let idx = app.right_panel_selected;
+                if app.right_panel_expanded.contains(&idx) {
+                    app.right_panel_expanded.remove(&idx);
+                } else {
+                    app.right_panel_expanded.insert(idx);
+                }
+                InputAction::None
+            }
+            KeyCode::Left => {
+                app.right_panel_focused = false;
+                InputAction::None
+            }
+            KeyCode::Esc | KeyCode::F(2) => {
+                app.right_panel_focused = false;
+                InputAction::None
+            }
+            _ => InputAction::None,
+        };
+    }
+
     match key.code {
         // Left arrow: focus left panel (if visible)
         KeyCode::Left if app.left_panel_visible && !app.left_panel_focused && key.modifiers.is_empty() => {
             app.left_panel_focused = true;
+            app.right_panel_focused = false;
             InputAction::None
         }
         // F1 toggles left panel
@@ -203,9 +262,26 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             app.left_panel_focused = app.left_panel_visible;
             InputAction::None
         }
-        // F2 toggles right panel
+        // F2 toggles right panel + focus
         KeyCode::F(2) => {
-            app.right_panel_visible = !app.right_panel_visible;
+            if app.right_panel_focused {
+                app.right_panel_focused = false;
+                app.right_panel_visible = false;
+            } else if app.right_panel_visible {
+                app.right_panel_focused = true;
+                // Jump selection to last event
+                app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
+            } else {
+                app.right_panel_visible = true;
+                app.right_panel_focused = true;
+                app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
+            }
+            InputAction::None
+        }
+        // Right arrow: focus right panel (if visible and not in left panel)
+        KeyCode::Right if app.right_panel_visible && !app.right_panel_focused && !app.left_panel_focused && key.modifiers.is_empty() => {
+            app.right_panel_focused = true;
+            app.right_panel_selected = app.right_panel_events.len().saturating_sub(1);
             InputAction::None
         }
         // Ctrl+Y toggles copy mode (disables mouse capture for text selection)

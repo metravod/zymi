@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use tokio::sync::oneshot;
@@ -95,6 +95,7 @@ pub struct ObservabilityEntry {
     pub icon: &'static str,
     pub kind: String,
     pub detail: String,
+    pub full_detail: String, // untruncated for expand view
 }
 
 const MAX_OBSERVABILITY_ENTRIES: usize = 500;
@@ -131,6 +132,14 @@ pub struct App {
     pub left_panel_section: LeftPanelSection,
     pub left_panel_index: usize,
     pub right_panel_events: VecDeque<ObservabilityEntry>,
+    pub right_panel_scroll: u16,
+    pub right_panel_auto_scroll: bool,
+    pub right_panel_total_lines: u16,
+    pub right_panel_visible_height: u16,
+    pub right_panel_x_range: (u16, u16), // (x_start, x_end) for mouse hit-test
+    pub right_panel_focused: bool,
+    pub right_panel_selected: usize,
+    pub right_panel_expanded: HashSet<usize>, // indices of expanded events
     pub system_files: Vec<String>,
     pub subagent_files: Vec<String>,
     pub memory_dir: PathBuf,
@@ -233,6 +242,14 @@ impl App {
             left_panel_section: LeftPanelSection::Models,
             left_panel_index: 0,
             right_panel_events: VecDeque::new(),
+            right_panel_scroll: 0,
+            right_panel_auto_scroll: true,
+            right_panel_total_lines: 0,
+            right_panel_visible_height: 0,
+            right_panel_x_range: (0, 0),
+            right_panel_focused: false,
+            right_panel_selected: 0,
+            right_panel_expanded: HashSet::new(),
             system_files,
             subagent_files,
             memory_dir,
@@ -493,72 +510,92 @@ impl App {
 
     pub fn handle_domain_event(&mut self, event: Event) {
         let ts = event.timestamp.format("%H:%M:%S").to_string();
-        let (icon, kind, detail) = match &event.kind {
-            EventKind::AgentProcessingStarted { .. } => (
-                "▶", "Processing".into(), String::new(),
+        let (icon, kind, detail, full_detail) = match &event.kind {
+            EventKind::AgentProcessingStarted { conversation_id } => (
+                "▶", "Processing".into(), String::new(), format!("conversation: {conversation_id}"),
             ),
-            EventKind::AgentProcessingCompleted { success, .. } => (
+            EventKind::AgentProcessingCompleted { success, conversation_id } => (
                 if *success { "✓" } else { "✗" },
                 "Completed".into(),
                 if *success { String::new() } else { "with errors".into() },
+                format!("conversation: {conversation_id}, success: {success}"),
             ),
             EventKind::LlmCallStarted { iteration } => (
                 "⚡", "LLM call".into(), format!("iteration {}", iteration + 1),
+                format!("iteration: {}", iteration + 1),
             ),
             EventKind::LlmCallCompleted { has_tool_calls, usage } => {
                 let tokens = usage.as_ref()
                     .map(|u| format!("↑{} ↓{}", u.input_tokens, u.output_tokens))
                     .unwrap_or_default();
                 let tools = if *has_tool_calls { " +tools" } else { "" };
-                ("✓", "LLM done".into(), format!("{tokens}{tools}"))
+                let full = usage.as_ref()
+                    .map(|u| format!("input: {} tokens, output: {} tokens, tool_calls: {}", u.input_tokens, u.output_tokens, has_tool_calls))
+                    .unwrap_or_default();
+                ("✓", "LLM done".into(), format!("{tokens}{tools}"), full)
             }
-            EventKind::ToolCallRequested { tool_name, arguments, .. } => {
+            EventKind::ToolCallRequested { tool_name, arguments, call_id } => {
                 let args_short = if arguments.len() > 60 {
                     format!("{}...", &arguments[..arguments.floor_char_boundary(60)])
                 } else {
                     arguments.clone()
                 };
-                ("🔧", format!("Tool: {tool_name}"), args_short)
+                let full = format!("call_id: {call_id}\ntool: {tool_name}\nargs: {arguments}");
+                ("🔧", format!("Tool: {tool_name}"), args_short, full)
             }
-            EventKind::ToolCallCompleted { call_id: _, result_preview, is_error, duration_ms } => {
+            EventKind::ToolCallCompleted { call_id, result_preview, is_error, duration_ms } => {
                 let icon = if *is_error { "✗" } else { "✓" };
                 let preview = if result_preview.len() > 60 {
                     format!("{}...", &result_preview[..result_preview.floor_char_boundary(60)])
                 } else {
                     result_preview.clone()
                 };
-                (icon, "Tool done".into(), format!("{preview} ({duration_ms}ms)"))
+                let full = format!("call_id: {call_id}\nduration: {duration_ms}ms\nerror: {is_error}\nresult: {result_preview}");
+                (icon, "Tool done".into(), format!("{preview} ({duration_ms}ms)"), full)
             }
-            EventKind::IntentionEmitted { intention_tag, .. } => (
+            EventKind::IntentionEmitted { intention_tag, intention_data } => (
                 "📋", "Intention".into(), intention_tag.clone(),
+                format!("tag: {intention_tag}\ndata: {intention_data}"),
             ),
             EventKind::IntentionEvaluated { intention_tag, verdict } => (
                 "📝", "Contract".into(), format!("{intention_tag}: {verdict}"),
+                format!("tag: {intention_tag}\nverdict: {verdict}"),
             ),
-            EventKind::ApprovalRequested { description, .. } => (
+            EventKind::ApprovalRequested { description, approval_id } => (
                 "⚠", "Approval".into(), description.clone(),
+                format!("id: {approval_id}\n{description}"),
             ),
-            EventKind::ApprovalDecided { approved, .. } => (
+            EventKind::ApprovalDecided { approved, approval_id } => (
                 if *approved { "✓" } else { "✗" },
                 "Decision".into(),
                 if *approved { "approved".into() } else { "rejected".into() },
+                format!("id: {approval_id}, approved: {approved}"),
             ),
-            EventKind::ResponseReady { .. } => (
-                "📨", "Response".into(), String::new(),
-            ),
-            EventKind::WorkflowStarted { node_count, .. } => (
+            EventKind::ResponseReady { conversation_id, content } => {
+                let preview = if content.len() > 80 {
+                    format!("{}...", &content[..content.floor_char_boundary(80)])
+                } else {
+                    content.clone()
+                };
+                ("📨", "Response".into(), preview, format!("conversation: {conversation_id}\n{content}"))
+            }
+            EventKind::WorkflowStarted { node_count, user_message } => (
                 "🔀", "Workflow".into(), format!("{node_count} nodes"),
+                format!("nodes: {node_count}\nmessage: {user_message}"),
             ),
             EventKind::WorkflowNodeStarted { node_id, description } => (
                 "▶", format!("WF:{node_id}"), description.clone(),
+                format!("node: {node_id}\n{description}"),
             ),
             EventKind::WorkflowNodeCompleted { node_id, success } => (
                 if *success { "✓" } else { "✗" },
                 format!("WF:{node_id}"), String::new(),
+                format!("node: {node_id}, success: {success}"),
             ),
             EventKind::WorkflowCompleted { success } => (
                 if *success { "✓" } else { "✗" },
                 "WF done".into(), String::new(),
+                format!("success: {success}"),
             ),
             _ => return, // Skip UserMessageReceived, ScheduledTaskTriggered
         };
@@ -568,11 +605,17 @@ impl App {
             icon,
             kind,
             detail,
+            full_detail,
         });
 
         // Cap at MAX_OBSERVABILITY_ENTRIES
         while self.right_panel_events.len() > MAX_OBSERVABILITY_ENTRIES {
             self.right_panel_events.pop_front();
+        }
+
+        // Reset scroll to bottom on new events (if user hasn't scrolled up)
+        if self.right_panel_auto_scroll {
+            self.right_panel_scroll = 0;
         }
     }
 

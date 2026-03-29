@@ -40,7 +40,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let show_right = app.right_panel_visible && terminal_width >= 100;
 
     let left_width: u16 = if show_left { 28 } else { 0 };
-    let right_width: u16 = if show_right { 44 } else { 0 };
+    let right_width: u16 = if show_right { 52 } else { 0 };
 
     // Build horizontal constraints
     let mut h_constraints = Vec::new();
@@ -70,7 +70,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Right panel
     if show_right {
         let right_idx = h_chunks.len() - 1;
-        draw_right_panel(f, app, h_chunks[right_idx]);
+        let right_area = h_chunks[right_idx];
+        app.right_panel_x_range = (right_area.x, right_area.x + right_area.width);
+        draw_right_panel(f, app, right_area);
+    } else {
+        app.right_panel_x_range = (0, 0);
     }
 
     // Hint bar at the very bottom, inside the outer frame
@@ -92,7 +96,7 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
     let input_height = (input_lines + 2).clamp(3, max_input_height);
 
     let constraints = vec![
-        Constraint::Length(6),  // header
+        Constraint::Length(7),  // header
         Constraint::Min(5),    // chat area
         Constraint::Length(1), // status line
         Constraint::Length(input_height), // input
@@ -110,7 +114,6 @@ fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
-    // Filled block-style logo using Unicode block elements
     let logo = Style::default()
         .fg(theme::SURFACE)
         .bg(theme::ACCENT)
@@ -122,21 +125,19 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let pad = "  ";
 
-    // Line 1: filled block art
+    //  Z     Y       M     I
     let line1 = Line::from(vec![
-        Span::styled(" \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2557}", logo),
+        Span::styled(" ███████╗██╗   ██╗███╗   ███╗██╗", logo),
     ]);
 
-    // Line 2 + version
     let line2 = Line::from(vec![
-        Span::styled(" \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
+        Span::styled(" ╚══███╔╝╚██╗ ██╔╝████╗ ████║██║", logo),
         Span::raw(pad),
         Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim),
     ]);
 
-    // Line 3 + model + copy mode
     let mut line3_spans = vec![
-        Span::styled("  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}\u{255a}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
+        Span::styled("   ███╔╝  ╚████╔╝ ██╔████╔██║██║", logo),
         Span::raw(pad),
         Span::styled("model: ", dim),
         Span::styled(model.to_string(), bold),
@@ -160,26 +161,28 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let line3 = Line::from(line3_spans);
 
-    // Line 4: bottom + cwd
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let line4 = Line::from(vec![
-        Span::styled(" \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d} \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}", logo),
+        Span::styled("  ███╔╝    ╚██╔╝  ██║╚██╔╝██║██║", logo),
         Span::raw(pad),
         Span::styled(cwd, dim),
     ]);
 
-    // Line 5: empty spacer
     let line5 = Line::from(vec![
-        Span::styled(" \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}  \u{255a}\u{2550}\u{2550}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}", logo),
+        Span::styled(" ███████╗   ██║   ██║ ╚═╝ ██║██║", logo),
     ]);
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(theme::BORDER));
 
-    let header_widget = Paragraph::new(vec![line1, line2, line3, line4, line5])
+    let line6 = Line::from(vec![
+        Span::styled(" ╚══════╝   ╚═╝   ╚═╝     ╚═╝╚═╝", logo),
+    ]);
+
+    let header_widget = Paragraph::new(vec![line1, line2, line3, line4, line5, line6])
         .block(block)
         .style(Style::default().bg(theme::SURFACE));
 
@@ -884,14 +887,17 @@ fn draw_left_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(agent_lines), subagents_inner);
 }
 
-fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
+fn draw_right_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.right_panel_focused;
+    let border_color = if focused { theme::ACCENT } else { theme::BORDER };
+
     let block = Block::default()
         .title(Span::styled(
             " Events ",
-            Style::default().fg(theme::BORDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER));
+        .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -907,8 +913,13 @@ fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let dim = Style::default().fg(theme::SUBTEXT);
+    let expanded_style = Style::default().fg(theme::TEXT);
+    let line_width = inner.width.saturating_sub(3) as usize;
 
-    for entry in &app.right_panel_events {
+    for (i, entry) in app.right_panel_events.iter().enumerate() {
+        let is_selected = focused && i == app.right_panel_selected;
+        let is_expanded = app.right_panel_expanded.contains(&i);
+
         // Timestamp + icon + kind
         let kind_style = if entry.kind.starts_with("Tool") || entry.kind.starts_with("WF:") {
             Style::default().fg(theme::TOOL)
@@ -922,29 +933,57 @@ fn draw_right_panel(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::TEXT)
         };
 
+        // Selected row gets highlighted background
+        let row_style = if is_selected {
+            kind_style.bg(theme::SURFACE)
+        } else {
+            kind_style
+        };
+        let ts_style = if is_selected { dim.bg(theme::SURFACE) } else { dim };
+
+        let expand_marker = if is_expanded { "▾" } else if !entry.full_detail.is_empty() && focused { "▸" } else { " " };
+
         lines.push(Line::from(vec![
-            Span::styled(format!("{} ", entry.timestamp), dim),
-            Span::styled(format!("{} ", entry.icon), kind_style),
-            Span::styled(entry.kind.clone(), kind_style),
+            Span::styled(expand_marker.to_string(), ts_style),
+            Span::styled(format!("{} ", entry.timestamp), ts_style),
+            Span::styled(format!("{} ", entry.icon), row_style),
+            Span::styled(entry.kind.clone(), row_style),
         ]));
 
-        if !entry.detail.is_empty() {
-            // Show more detail text — allow up to 2 lines worth
-            let max_detail = inner.width.saturating_sub(3) as usize * 2;
-            let detail = truncate_str(&entry.detail, max_detail);
-            for detail_line in wrap_text(&detail, inner.width.saturating_sub(3) as usize) {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(detail_line, dim),
-                ]));
+        if is_expanded && !entry.full_detail.is_empty() {
+            // Show full detail, wrapped
+            for full_line in entry.full_detail.lines() {
+                for wrapped in wrap_text(full_line, line_width) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wrapped, expanded_style),
+                    ]));
+                }
             }
+            lines.push(Line::default());
+        } else if !entry.detail.is_empty() {
+            // Collapsed: show short detail
+            let detail = truncate_str(&entry.detail, line_width);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(detail, dim),
+            ]));
         }
     }
 
-    // Auto-scroll to bottom
     let total_height = lines.len() as u16;
     let visible = inner.height;
-    let scroll = total_height.saturating_sub(visible);
+    app.right_panel_total_lines = total_height;
+    app.right_panel_visible_height = visible;
+
+    // Scroll: auto_scroll means pinned to bottom, otherwise use offset
+    let max_scroll = total_height.saturating_sub(visible);
+    let scroll = if app.right_panel_auto_scroll {
+        app.right_panel_scroll = 0;
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.right_panel_scroll)
+    };
 
     let panel = Paragraph::new(lines).scroll((scroll, 0));
     f.render_widget(panel, inner);
@@ -954,7 +993,14 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let dim = Style::default().fg(theme::SUBTEXT);
     let key_style = Style::default().fg(theme::ACCENT);
 
-    let hints = if app.left_panel_focused {
+    let hints = if app.right_panel_focused {
+        vec![
+            Span::styled(" \u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
+            Span::styled("Enter", key_style), Span::styled(":Expand ", dim),
+            Span::styled("\u{2190}", key_style), Span::styled(":Chat ", dim),
+            Span::styled("F2", key_style), Span::styled(":Hide ", dim),
+        ]
+    } else if app.left_panel_focused {
         vec![
             Span::styled(" Tab", key_style), Span::styled(":Section ", dim),
             Span::styled("\u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
@@ -978,6 +1024,11 @@ fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         if app.left_panel_visible {
             h.extend([
                 Span::styled(" \u{2190}", key_style), Span::styled(":Sidebar ", dim),
+            ]);
+        }
+        if app.right_panel_visible {
+            h.extend([
+                Span::styled(" \u{2192}", key_style), Span::styled(":Events ", dim),
             ]);
         }
         h.extend([

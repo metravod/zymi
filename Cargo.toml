@@ -42,6 +42,7 @@ rand = "0.9"
 hex = "0.4"
 urlencoding = "2"
 toml = "0.8"
+serde_yaml = "0.9"
 
 
 [profile.release]

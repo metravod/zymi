@@ -4,6 +4,7 @@ pub mod current_time;
 pub mod eval_gen;
 pub mod eval_run;
 pub mod manage_mcp;
+pub mod manage_skills;
 pub mod mcp;
 pub mod memory;
 pub mod planning;

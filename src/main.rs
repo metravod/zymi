@@ -11,6 +11,7 @@ mod mcp;
 mod policy;
 mod sandbox;
 mod scheduler;
+mod skills;
 mod setup;
 mod storage;
 mod task_registry;
@@ -42,6 +43,7 @@ use crate::tools::current_time::CurrentTimeTool;
 use crate::tools::eval_gen::GenerateEvalsTool;
 use crate::tools::eval_run::RunEvalsTool;
 use crate::tools::manage_mcp::ManageMcpTool;
+use crate::tools::manage_skills::ManageSkillsTool;
 use crate::tools::memory::{ReadMemoryTool, WriteMemoryTool};
 use crate::tools::policy::ManagePolicyTool;
 use crate::tools::planning::PlanningTool;
@@ -410,6 +412,10 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
     tools.extend(mcp_tools);
     let mcp_manager = Arc::new(tokio::sync::Mutex::new(mcp_manager));
 
+    // Skills: community-contributed extensions from git repos
+    let skill_manager = Arc::new(skills::SkillManager::init(&memory_dir));
+    tools.push(Box::new(ManageSkillsTool::new(skill_manager.clone())));
+
     // Collect tool catalog for the workflow planner (names + descriptions)
     let available_tools: Vec<ToolInfo> = tools
         .iter()
@@ -490,7 +496,8 @@ async fn build_app(cli: &Cli, memory_dir: PathBuf) -> Result<App> {
         .with_workflow_engine(workflow_engine)
         .with_audit(audit_log.clone())
         .with_auto_extract(settings.auto_extract)
-        .with_mcp_manager(mcp_manager.clone());
+        .with_mcp_manager(mcp_manager.clone())
+        .with_skill_manager(skill_manager);
 
     if let Some(selector) = tool_selector {
         agent_builder = agent_builder.with_tool_selector(selector);

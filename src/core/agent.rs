@@ -16,6 +16,7 @@ use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
 use crate::events::{Event, EventKind};
 use crate::mcp::McpManager;
+use crate::skills::SkillManager;
 use crate::storage::ConversationStorage;
 use crate::tools::Tool;
 use crate::workflow::WorkflowEngine;
@@ -128,6 +129,7 @@ pub struct Agent {
     auto_extract: bool,
     last_extract_ms: AtomicI64,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
+    skill_manager: Option<Arc<SkillManager>>,
     event_bus: Option<Arc<EventBus>>,
     orchestrator: Option<Arc<Orchestrator>>,
 }
@@ -156,6 +158,7 @@ impl Agent {
             auto_extract: false,
             last_extract_ms: AtomicI64::new(0),
             mcp_manager: None,
+            skill_manager: None,
             event_bus: None,
             orchestrator: None,
         }
@@ -203,6 +206,11 @@ impl Agent {
 
     pub fn with_mcp_manager(mut self, manager: Arc<tokio::sync::Mutex<McpManager>>) -> Self {
         self.mcp_manager = Some(manager);
+        self
+    }
+
+    pub fn with_skill_manager(mut self, manager: Arc<SkillManager>) -> Self {
+        self.skill_manager = Some(manager);
         self
     }
 
@@ -592,6 +600,26 @@ impl Agent {
             messages.push(Message::System(format!(
                 "[Known facts about user — already loaded, do NOT re-read via read_memory]\n\n{facts}"
             )));
+        }
+
+        // Inject relevant skills into context
+        if let Some(ref sm) = self.skill_manager {
+            if let Some(text) = user_message.user_text() {
+                let matched = sm.match_skills(text).await;
+                for skill in &matched {
+                    messages.push(Message::System(format!(
+                        "[Skill: {}]\n\n{}",
+                        skill.name, skill.body
+                    )));
+                }
+                if !matched.is_empty() {
+                    log::info!(
+                        "Injected {} skill(s): [{}]",
+                        matched.len(),
+                        matched.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
         }
 
         // Fire-and-forget fact extraction from user message

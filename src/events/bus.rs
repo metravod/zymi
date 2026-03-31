@@ -33,13 +33,25 @@ impl EventBus {
     ///
     /// Events are always persisted even if no subscriber is available or all buffers are full.
     pub async fn publish(&self, mut event: Event) -> Result<(), EventStoreError> {
+        let tag = event.kind_tag();
         self.store.append(&mut event).await?;
 
         let subs = self.subscribers.read().await;
+        let mut delivered = 0usize;
+        let mut dropped = 0usize;
         for tx in subs.iter() {
             // try_send: non-blocking, drops the event for this subscriber if buffer is full.
             // The event is still in the store — subscriber can replay if needed.
-            let _ = tx.try_send(event.clone());
+            match tx.try_send(event.clone()) {
+                Ok(()) => delivered += 1,
+                Err(_) => dropped += 1,
+            }
+        }
+        if dropped > 0 {
+            log::warn!(
+                "EventBus: {tag} delivered to {delivered}/{} subscribers ({dropped} dropped)",
+                subs.len()
+            );
         }
         Ok(())
     }

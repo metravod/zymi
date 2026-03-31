@@ -50,6 +50,8 @@ pub struct WorkflowResult {
     pub response: String,
     /// MCP server names that were connected during this workflow (ConnectMcp nodes).
     pub new_mcp_servers: Vec<String>,
+    /// Aggregated token usage across all LLM calls in the workflow.
+    pub usage: Option<crate::core::TokenUsage>,
 }
 
 const SYNTHESIS_PROMPT: &str = "\
@@ -233,6 +235,8 @@ impl WorkflowEngine {
         Ok(WorkflowResult {
             response,
             new_mcp_servers,
+            // TODO: aggregate token usage from workflow LLM calls
+            usage: None,
         })
     }
 

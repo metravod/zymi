@@ -259,13 +259,18 @@ impl Agent {
     /// Uses spawn_blocking-safe publish; errors are logged but don't fail the agent.
     fn emit_event(&self, stream_id: &str, kind: EventKind) {
         if let Some(ref bus) = self.event_bus {
+            let tag = kind.tag();
             let bus = bus.clone();
             let event = Event::new(stream_id.to_string(), kind, "agent".into());
             tokio::spawn(async move {
                 if let Err(e) = bus.publish(event).await {
-                    log::warn!("Failed to emit agent event: {e}");
+                    log::warn!("Failed to emit agent event ({tag}): {e}");
+                } else {
+                    log::debug!("Emitted domain event: {tag}");
                 }
             });
+        } else {
+            log::warn!("emit_event called but event_bus is None");
         }
     }
 
@@ -884,6 +889,25 @@ impl Agent {
         if let Some(ref engine) = self.workflow_engine {
             match engine.process(&user_text, event_tx.clone()).await {
                 Ok(result) => {
+                    self.emit_event(conversation_id, EventKind::WorkflowCompleted {
+                        success: true,
+                    });
+
+                    // Emit usage from workflow's aggregated LLM calls
+                    if let Some(ref usage) = result.usage {
+                        let _ = event_tx.send(StreamEvent::Usage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            message_count: 0,
+                            summary_threshold: self.summary_threshold,
+                        });
+                        self.emit_event(conversation_id, EventKind::LlmCallCompleted {
+                            has_tool_calls: false,
+                            usage: Some(usage.clone()),
+                            content_preview: None,
+                        });
+                    }
+
                     // Connect new MCP servers discovered by workflow
                     if !result.new_mcp_servers.is_empty() {
                         self.connect_new_mcp_servers(&result.new_mcp_servers).await;
@@ -897,6 +921,7 @@ impl Agent {
                 }
                 Err(crate::workflow::WorkflowError::SimpleTask { score }) => {
                     log::info!("Workflow: simple task (score {score}), using standard agent");
+                    // Falls through to standard agent loop — events emitted below
                 }
                 Err(e) => {
                     log::error!("Workflow engine error: {e}, falling back to standard agent");

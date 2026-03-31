@@ -396,6 +396,7 @@ pub async fn run(
             }
             // Domain events for right panel (observability)
             Some(event) = domain_rx.recv() => {
+                log::debug!("CLI received domain event: {}", event.kind_tag());
                 app.handle_domain_event(event);
             }
             // Debug events

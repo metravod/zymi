@@ -8,8 +8,8 @@ use async_openai::{
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
         ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequestArgs,
-        FunctionCall, FunctionObjectArgs, ImageUrl,
+        ChatCompletionStreamOptions, ChatCompletionToolArgs, ChatCompletionToolType,
+        CreateChatCompletionRequestArgs, FunctionCall, FunctionObjectArgs, ImageUrl,
     },
     Client,
 };
@@ -151,7 +151,12 @@ fn build_request(
         .collect::<Result<_, _>>()?;
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
-    request_builder.model(model).messages(oai_messages);
+    request_builder
+        .model(model)
+        .messages(oai_messages)
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: true,
+        });
 
     if !tools.is_empty() {
         let oai_tools: Vec<_> = tools
@@ -274,7 +279,7 @@ impl LlmProvider for OpenAiProvider {
         while let Some(result) = stream.next().await {
             let response = result.map_err(|e| LlmError::ApiError(e.to_string()))?;
 
-            // Capture usage from final chunk (if stream_options include_usage was set)
+            // Capture usage from the final chunk (stream_options.include_usage = true)
             if let Some(ref u) = response.usage {
                 usage = Some(TokenUsage {
                     input_tokens: u.prompt_tokens,

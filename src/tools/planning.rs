@@ -82,7 +82,7 @@ impl PlanningTool {
 
         let conversation_id = format!("simulation-{}", uuid::Uuid::new_v4());
 
-        match agent.process(&conversation_id, task, None).await {
+        match agent.process_text(&conversation_id, task, None).await {
             Ok(response) => response,
             Err(e) => format!("Simulation error: {e}"),
         }

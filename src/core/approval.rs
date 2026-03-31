@@ -12,7 +12,7 @@ pub trait ApprovalHandler: Send + Sync {
 }
 
 /// A shared slot for the current approval handler.
-/// Connectors set it before calling agent.process() and clear it after.
+/// Connectors set it before calling agent.process_stream() and clear it after.
 /// Sub-agents read from this slot to get shell approval capability.
 pub type SharedApprovalHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn ApprovalHandler>>>>;
 

@@ -196,7 +196,7 @@ impl Tool for SpawnSubAgentTool {
             });
         let handler_ref = contextual.as_ref().map(|h| h.as_ref());
 
-        match agent.process(&conversation_id, task, handler_ref).await {
+        match agent.process_text(&conversation_id, task, handler_ref).await {
             Ok(response) => {
                 log::info!("Sub-agent '{}' completed successfully", agent_name);
                 Ok(response)

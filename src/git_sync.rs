@@ -130,8 +130,10 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("`{cmd_str}` failed to execute: {e}"))?;
 

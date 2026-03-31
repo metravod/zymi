@@ -54,6 +54,12 @@ impl Tool for WebSearchTool {
         }
     }
 
+    fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
+        let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let query = args["query"].as_str()?.to_string();
+        Some(crate::esaa::Intention::WebSearch { query })
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String, String> {
         let args: serde_json::Value =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;

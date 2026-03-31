@@ -631,7 +631,7 @@ pub async fn run_single_eval(
 
     let output = match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        agent.process(&conversation_id, &eval_case.input, None),
+        agent.process_text(&conversation_id, &eval_case.input, None),
     )
     .await
     {

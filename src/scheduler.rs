@@ -136,7 +136,7 @@ async fn execute_entry(
 
     let conversation_id = format!("scheduled-{}", uuid::Uuid::new_v4());
 
-    match agent.process(&conversation_id, &entry.task, None).await {
+    match agent.process_text(&conversation_id, &entry.task, None).await {
         Ok(response) => {
             log::info!(
                 "Scheduled task '{}' completed: {:?}, response_len={}",

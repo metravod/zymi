@@ -1,9 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+
+use crate::events::bus::EventBus;
+use crate::events::EventKind;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
@@ -103,6 +107,78 @@ async fn writer_loop(path: PathBuf, mut rx: mpsc::UnboundedReceiver<AuditEntry>)
 
         if let Err(e) = file.write_all(line.as_bytes()).await {
             log::error!("Audit log: failed to write: {e}");
+        }
+    }
+}
+
+/// Event bus subscriber that projects domain events into the audit log.
+/// Runs alongside direct audit writes during migration; once verified identical,
+/// direct writes from agent.rs can be removed.
+pub struct AuditProjection {
+    bus: Arc<EventBus>,
+    audit: AuditLog,
+}
+
+impl AuditProjection {
+    pub fn new(bus: Arc<EventBus>, audit: AuditLog) -> Self {
+        Self { bus, audit }
+    }
+
+    /// Run the projection loop. Call from `tokio::spawn`.
+    pub async fn run(self) {
+        let mut rx = self.bus.subscribe().await;
+
+        while let Some(event) = rx.recv().await {
+            let conversation_id = Some(event.stream_id.clone());
+
+            match event.kind {
+                EventKind::ToolCallCompleted {
+                    call_id: _,
+                    ref result_preview,
+                    is_error,
+                    duration_ms: _,
+                } => {
+                    // We don't have tool name/arguments in ToolCallCompleted,
+                    // so we emit a minimal audit entry. The full details are
+                    // already logged by the direct audit path in agent.rs.
+                    // Once we migrate fully, ToolCallRequested + Completed
+                    // will provide all fields.
+                    self.audit.log_with_conversation(
+                        AuditEvent::ToolCall {
+                            tool: String::new(),
+                            arguments: String::new(),
+                            result_preview: result_preview.clone(),
+                            is_error,
+                        },
+                        conversation_id,
+                    );
+                }
+                EventKind::ApprovalDecided {
+                    ref approval_id,
+                    approved,
+                } => {
+                    self.audit.log_with_conversation(
+                        AuditEvent::ApprovalRequest {
+                            tool: String::new(),
+                            description: approval_id.clone(),
+                            approved,
+                        },
+                        conversation_id,
+                    );
+                }
+                EventKind::AgentProcessingStarted { .. } => {
+                    self.audit.log_with_conversation(
+                        AuditEvent::AgentStart {
+                            model: "event_sourced".into(),
+                        },
+                        conversation_id,
+                    );
+                }
+                EventKind::AgentProcessingCompleted { .. } => {
+                    self.audit.log_with_conversation(AuditEvent::AgentStop, conversation_id);
+                }
+                _ => {}
+            }
         }
     }
 }

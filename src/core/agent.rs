@@ -11,8 +11,12 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::core::approval::ApprovalHandler;
 use crate::core::langfuse::{self, LangfuseClient, TraceCtx};
 use crate::core::tool_selector::ToolSelector;
-use crate::core::{LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
+use crate::core::{ContentPart, LlmError, LlmProvider, LlmResponse, Message, StreamEvent, ToolDefinition};
+use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
+use crate::events::bus::EventBus;
+use crate::events::{Event, EventKind};
 use crate::mcp::McpManager;
+use crate::skills::SkillManager;
 use crate::storage::ConversationStorage;
 use crate::tools::Tool;
 use crate::workflow::WorkflowEngine;
@@ -24,6 +28,22 @@ fn truncate_for_log(s: &str, max: usize) -> String {
         let end = s.floor_char_boundary(max);
         format!("{}...", &s[..end])
     }
+}
+
+/// Rough estimate of context size in characters (for observability, not billing).
+fn estimate_context_chars(messages: &[Message]) -> usize {
+    messages.iter().map(|m| match m {
+        Message::System(s) | Message::User(s) => s.len(),
+        Message::UserMultimodal { parts } => parts.iter().map(|p| match p {
+            ContentPart::Text(t) => t.len(),
+            ContentPart::ImageBase64 { data, .. } => data.len(),
+        }).sum(),
+        Message::Assistant { content, tool_calls } => {
+            content.as_deref().map_or(0, str::len)
+                + tool_calls.iter().map(|tc| tc.name.len() + tc.arguments.len()).sum::<usize>()
+        }
+        Message::ToolResult { content, .. } => content.len(),
+    }).sum()
 }
 
 /// Build a dedup key for a tool call. For search tools, normalize the query
@@ -109,6 +129,9 @@ pub struct Agent {
     auto_extract: bool,
     last_extract_ms: AtomicI64,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
+    skill_manager: Option<Arc<SkillManager>>,
+    event_bus: Option<Arc<EventBus>>,
+    orchestrator: Option<Arc<Orchestrator>>,
 }
 
 impl Agent {
@@ -135,6 +158,9 @@ impl Agent {
             auto_extract: false,
             last_extract_ms: AtomicI64::new(0),
             mcp_manager: None,
+            skill_manager: None,
+            event_bus: None,
+            orchestrator: None,
         }
     }
 
@@ -183,8 +209,23 @@ impl Agent {
         self
     }
 
+    pub fn with_skill_manager(mut self, manager: Arc<SkillManager>) -> Self {
+        self.skill_manager = Some(manager);
+        self
+    }
+
     pub fn with_auto_extract(mut self, enabled: bool) -> Self {
         self.auto_extract = enabled;
+        self
+    }
+
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
+    }
+
+    pub fn with_orchestrator(mut self, orchestrator: Arc<Orchestrator>) -> Self {
+        self.orchestrator = Some(orchestrator);
         self
     }
 
@@ -212,6 +253,20 @@ impl Agent {
             }
         }
         log::info!("Registered {} tools at runtime: [{}]", names.len(), names.join(", "));
+    }
+
+    /// Emit an event to the event bus (fire-and-forget).
+    /// Uses spawn_blocking-safe publish; errors are logged but don't fail the agent.
+    fn emit_event(&self, stream_id: &str, kind: EventKind) {
+        if let Some(ref bus) = self.event_bus {
+            let bus = bus.clone();
+            let event = Event::new(stream_id.to_string(), kind, "agent".into());
+            tokio::spawn(async move {
+                if let Err(e) = bus.publish(event).await {
+                    log::warn!("Failed to emit agent event: {e}");
+                }
+            });
+        }
     }
 
     /// Post-tool-call hook: trigger MCP hot-reload when manage_mcp adds a server.
@@ -547,6 +602,26 @@ impl Agent {
             )));
         }
 
+        // Inject relevant skills into context
+        if let Some(ref sm) = self.skill_manager {
+            if let Some(text) = user_message.user_text() {
+                let matched = sm.match_skills(text).await;
+                for skill in &matched {
+                    messages.push(Message::System(format!(
+                        "[Skill: {}]\n\n{}",
+                        skill.name, skill.body
+                    )));
+                }
+                if !matched.is_empty() {
+                    log::info!(
+                        "Injected {} skill(s): [{}]",
+                        matched.len(),
+                        matched.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+        }
+
         // Fire-and-forget fact extraction from user message
         if let Some(text) = user_message.user_text() {
             self.spawn_extract(text);
@@ -563,7 +638,7 @@ impl Agent {
         Ok((messages, history_len))
     }
 
-    /// Execute a single tool call: dedup check, approval, execution.
+    /// Execute a single tool call: dedup check, ESAA orchestration or legacy approval, execution.
     /// Returns `(result_text, is_duplicate)`.
     async fn execute_tool_call(
         &self,
@@ -571,6 +646,7 @@ impl Agent {
         explanation: Option<&str>,
         approval_handler: Option<&dyn ApprovalHandler>,
         tool_call_cache: &mut HashMap<String, ()>,
+        conversation_id: &str,
     ) -> Result<(String, bool), LlmError> {
         let dedup_key = tool_dedup_key(&tool_call.name, &tool_call.arguments);
         if tool_call_cache.contains_key(&dedup_key) {
@@ -593,34 +669,91 @@ impl Agent {
 
         let result = match tool_arc {
             Some(ref tool) => {
-                if tool.requires_approval_for(&tool_call.arguments) {
-                    let approved = if let Some(handler) = approval_handler {
-                        let description = tool.format_approval_request(&tool_call.arguments);
-                        handler
-                            .request_approval(&description, explanation)
-                            .await
-                            .map_err(LlmError::ApprovalError)?
+                // ESAA path: route through orchestrator when tool supports intentions
+                let esaa_verdict = if let Some(ref orchestrator) = self.orchestrator {
+                    if let Some(intention) = tool.to_intention(&tool_call.arguments) {
+                        let correlation_id = uuid::Uuid::new_v4();
+                        Some(
+                            orchestrator
+                                .process_intention(
+                                    &intention,
+                                    conversation_id,
+                                    correlation_id,
+                                    approval_handler,
+                                )
+                                .await,
+                        )
                     } else {
-                        log::warn!(
-                            "Tool '{}' requires approval but no handler available",
-                            tool_call.name
-                        );
-                        false
-                    };
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                    if !approved {
-                        "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
-                    } else {
+                match esaa_verdict {
+                    Some(OrchestratorResult::Approved) => {
+                        log::info!("ESAA: tool '{}' approved by orchestrator", tool_call.name);
                         tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
                             log::error!("Tool '{}' error: {}", tool_call.name, e);
                             format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
                         })
                     }
-                } else {
-                    tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
-                        log::error!("Tool '{}' error: {}", tool_call.name, e);
-                        format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
-                    })
+                    Some(OrchestratorResult::Denied { reason }) => {
+                        log::info!("ESAA: tool '{}' denied: {reason}", tool_call.name);
+                        format!("Tool execution denied: {reason}")
+                    }
+                    Some(OrchestratorResult::HumanRejected) => {
+                        log::info!("ESAA: tool '{}' rejected by user", tool_call.name);
+                        "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
+                    }
+                    Some(OrchestratorResult::NoApprovalHandler) => {
+                        log::warn!("ESAA: tool '{}' requires approval but no handler", tool_call.name);
+                        "Tool execution requires approval but no approval handler is available.".to_string()
+                    }
+                    None => {
+                        // Legacy path: no orchestrator or tool doesn't support intentions
+                        if tool.requires_approval_for(&tool_call.arguments) {
+                            let description = tool.format_approval_request(&tool_call.arguments);
+                            let approval_id = uuid::Uuid::new_v4().to_string();
+
+                            self.emit_event(conversation_id, EventKind::ApprovalRequested {
+                                description: description.clone(),
+                                approval_id: approval_id.clone(),
+                            });
+
+                            let approved = if let Some(handler) = approval_handler {
+                                handler
+                                    .request_approval(&description, explanation)
+                                    .await
+                                    .map_err(LlmError::ApprovalError)?
+                            } else {
+                                log::warn!(
+                                    "Tool '{}' requires approval but no handler available",
+                                    tool_call.name
+                                );
+                                false
+                            };
+
+                            self.emit_event(conversation_id, EventKind::ApprovalDecided {
+                                approval_id,
+                                approved,
+                            });
+
+                            if !approved {
+                                "Tool execution was rejected by user. Try an alternative approach if possible.".to_string()
+                            } else {
+                                tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
+                                    log::error!("Tool '{}' error: {}", tool_call.name, e);
+                                    format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
+                                })
+                            }
+                        } else {
+                            tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
+                                log::error!("Tool '{}' error: {}", tool_call.name, e);
+                                format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
+                            })
+                        }
+                    }
                 }
             }
             None => {
@@ -714,151 +847,19 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn process_multimodal(
-        &self,
-        conversation_id: &str,
-        user_message: Message,
-        approval_handler: Option<&dyn ApprovalHandler>,
-    ) -> Result<String, LlmError> {
-        let user_text = user_message.user_text().unwrap_or("").to_string();
-        log::info!(
-            "Agent process: conversation_id={}, message_len={}",
-            conversation_id,
-            user_text.len()
-        );
-
-        let trace = self.trace_ctx(conversation_id, &user_text);
-
-        let (mut messages, _history_len) = self.prepare_messages(conversation_id, user_message).await?;
-        let tool_definitions = self.get_tool_definitions(&user_text).await;
-        let mut monitor_reviews: usize = 0;
-        let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
-
-        for iteration in 0..self.max_iterations {
-            log::info!("Iteration {}/{}", iteration + 1, self.max_iterations);
-
-            let llm_start = langfuse::timestamp();
-            let response = self.chat_with_timeout(&messages, &tool_definitions).await?;
-            let llm_end = langfuse::timestamp();
-            self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
-
-            if response.tool_calls.is_empty() {
-                let content = response.content.ok_or(LlmError::EmptyResponse)?;
-
-                let max_reviews = self.monitor.as_ref().map_or(0, |m| m.max_reviews);
-                if monitor_reviews < max_reviews {
-                    log::info!("Monitor: draft response ({} chars):\n{content}", content.len());
-                    if let Some(feedback) = self.run_monitor(&messages, &content).await {
-                        log::info!("Monitor: feedback:\n{feedback}");
-                        messages.push(Message::User(format!(
-                            "[INTERNAL — revision required]\n\
-                            Your draft response was:\n---\n{content}\n---\n\n\
-                            Quality feedback:\n{feedback}\n\n\
-                            Rewrite your response to the user's original message. \
-                            Output ONLY the improved response, nothing else."
-                        )));
-                        monitor_reviews += 1;
-                        continue;
-                    }
-                }
-
-                if monitor_reviews > 0 {
-                    log::info!("Monitor: final response after {} revision(s) ({} chars):\n{content}", monitor_reviews, content.len());
-                }
-
-                if let Some(ref t) = trace { t.finish(&content); }
-                self.finalize_response(conversation_id, &content).await?;
-                return Ok(content);
-            }
-
-            let explanation = response.content.clone();
-            let assistant_msg = Message::Assistant {
-                content: response.content,
-                tool_calls: response.tool_calls.clone(),
-            };
-            self.storage
-                .add_message(conversation_id, &assistant_msg)
-                .await
-                .map_err(|e| LlmError::StorageError(e.to_string()))?;
-            messages.push(assistant_msg);
-
-            let mut abort_for_photo = false;
-
-            for tool_call in &response.tool_calls {
-                log::info!(
-                    "Tool call: {} | args: {}",
-                    tool_call.name,
-                    truncate_for_log(&tool_call.arguments, 200)
-                );
-
-                let tool_start = langfuse::timestamp();
-                let (result, is_dup) = self
-                    .execute_tool_call(
-                        tool_call,
-                        explanation.as_deref(),
-                        approval_handler,
-                        &mut tool_call_cache,
-                    )
-                    .await?;
-                let tool_end = langfuse::timestamp();
-
-                if let Some(ref t) = trace {
-                    let is_error = is_dup
-                        || result.starts_with("Tool error:")
-                        || result.starts_with("Unknown tool:");
-                    t.record_tool(&tool_call.name, &tool_call.arguments, &result, is_error, &tool_start, &tool_end);
-                }
-
-                self.post_tool_hook(&tool_call.name, &tool_call.arguments, &result).await;
-
-                // Detect ask_user superseded by an incoming photo/media.
-                // The connector sends [MEDIA_RECEIVED] when a non-text message
-                // cancels the pending question, or the oneshot is dropped
-                // ("User input cancelled").  In either case, stop iterating —
-                // the photo will be handled by the next queued handler.
-                if tool_call.name == "ask_user"
-                    && (result.contains("[MEDIA_RECEIVED]")
-                        || result.contains("User input cancelled"))
-                {
-                    log::info!("ask_user superseded by incoming photo; aborting agent loop");
-                    abort_for_photo = true;
-                }
-
-                self.store_tool_result(conversation_id, &tool_call.id, result, &mut messages)
-                    .await?;
-            }
-
-            if abort_for_photo {
-                return Ok(String::new());
-            }
-        }
-
-        // Forced conclusion
-        log::warn!("Max iterations ({}) exceeded, forcing conclusion", self.max_iterations);
-        let llm_start = langfuse::timestamp();
-        let response = self.chat_with_timeout(&messages, &[]).await?;
-        let llm_end = langfuse::timestamp();
-        self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
-
-        let content = response
-            .content
-            .unwrap_or_else(|| "I was unable to complete the task within the iteration limit.".to_string());
-
-        if let Some(ref t) = trace { t.finish(&content); }
-        self.finalize_response(conversation_id, &content).await?;
-        Ok(content)
-    }
-
-    pub async fn process(
+    /// Convenience wrapper: delegates to `process_stream` with a discarded event channel.
+    pub async fn process_text(
         &self,
         conversation_id: &str,
         user_message: &str,
         approval_handler: Option<&dyn ApprovalHandler>,
     ) -> Result<String, LlmError> {
-        self.process_multimodal(
+        let (tx, _rx) = mpsc::unbounded_channel();
+        self.process_stream(
             conversation_id,
             Message::User(user_message.to_string()),
             approval_handler,
+            tx,
         )
         .await
     }
@@ -866,21 +867,22 @@ impl Agent {
     pub async fn process_stream(
         &self,
         conversation_id: &str,
-        user_message: &str,
+        user_message: Message,
         approval_handler: Option<&dyn ApprovalHandler>,
         event_tx: mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<String, LlmError> {
+        let user_text = user_message.user_text().unwrap_or("").to_string();
         log::info!(
             "Agent process_stream: conversation_id={}, message_len={}",
             conversation_id,
-            user_message.len()
+            user_text.len()
         );
 
-        let trace = self.trace_ctx(conversation_id, user_message);
+        let trace = self.trace_ctx(conversation_id, &user_text);
 
         // --- Workflow engine routing ---
         if let Some(ref engine) = self.workflow_engine {
-            match engine.process(user_message, event_tx.clone()).await {
+            match engine.process(&user_text, event_tx.clone()).await {
                 Ok(result) => {
                     // Connect new MCP servers discovered by workflow
                     if !result.new_mcp_servers.is_empty() {
@@ -902,8 +904,8 @@ impl Agent {
             }
         }
 
-        let (mut messages, history_len) = self.prepare_messages(conversation_id, Message::User(user_message.to_string())).await?;
-        let tool_definitions = self.get_tool_definitions(user_message).await;
+        let (mut messages, history_len) = self.prepare_messages(conversation_id, user_message).await?;
+        let tool_definitions = self.get_tool_definitions(&user_text).await;
         let mut monitor_reviews: usize = 0;
         let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
         let mut msg_count = history_len;
@@ -911,6 +913,12 @@ impl Agent {
         for iteration in 0..self.max_iterations {
             log::info!("Stream iteration {}/{}", iteration + 1, self.max_iterations);
             let _ = event_tx.send(StreamEvent::IterationStart(iteration));
+
+            self.emit_event(conversation_id, EventKind::LlmCallStarted {
+                iteration,
+                message_count: messages.len(),
+                approx_context_chars: estimate_context_chars(&messages),
+            });
 
             let max_reviews = self.monitor.as_ref().map_or(0, |m| m.max_reviews);
             let pending_review = monitor_reviews < max_reviews;
@@ -924,6 +932,12 @@ impl Agent {
             };
             let llm_end = langfuse::timestamp();
             self.trace_generation(trace.as_ref(), &messages, &response, &llm_start, &llm_end);
+
+            self.emit_event(conversation_id, EventKind::LlmCallCompleted {
+                has_tool_calls: !response.tool_calls.is_empty(),
+                usage: response.usage.clone(),
+                content_preview: response.content.as_deref().map(|c| truncate_for_log(c, 200)),
+            });
 
             if let Some(ref usage) = response.usage {
                 let _ = event_tx.send(StreamEvent::Usage {
@@ -986,12 +1000,19 @@ impl Agent {
                     truncate_for_log(&tool_call.arguments, 200)
                 );
 
+                self.emit_event(conversation_id, EventKind::ToolCallRequested {
+                    tool_name: tool_call.name.clone(),
+                    arguments: truncate_for_log(&tool_call.arguments, 500),
+                    call_id: tool_call.id.clone(),
+                });
+
                 let _ = event_tx.send(StreamEvent::ToolCallStart {
                     id: tool_call.id.clone(),
                     name: tool_call.name.clone(),
                     arguments: tool_call.arguments.clone(),
                 });
 
+                let tool_start_time = std::time::Instant::now();
                 let tool_start = langfuse::timestamp();
                 let (result, is_dup) = self
                     .execute_tool_call(
@@ -999,13 +1020,22 @@ impl Agent {
                         explanation.as_deref(),
                         approval_handler,
                         &mut tool_call_cache,
+                        conversation_id,
                     )
                     .await?;
                 let tool_end = langfuse::timestamp();
+                let duration_ms = tool_start_time.elapsed().as_millis() as u64;
 
                 let is_error = is_dup
                     || result.starts_with("Tool error:")
                     || result.starts_with("Unknown tool:");
+
+                self.emit_event(conversation_id, EventKind::ToolCallCompleted {
+                    call_id: tool_call.id.clone(),
+                    result_preview: truncate_for_log(&result, 200),
+                    is_error,
+                    duration_ms,
+                });
 
                 if let Some(ref t) = trace {
                     t.record_tool(&tool_call.name, &tool_call.arguments, &result, is_error, &tool_start, &tool_end);
@@ -1153,7 +1183,7 @@ mod tests {
         ]));
 
         let agent = make_agent(agent_provider, Some(monitor_provider));
-        let result = agent.process("test-conv", "hi", None).await.unwrap();
+        let result = agent.process_text("test-conv", "hi", None).await.unwrap();
         assert_eq!(result, "Hello, world!");
     }
 
@@ -1173,7 +1203,7 @@ mod tests {
         ]));
 
         let agent = make_agent(agent_provider, Some(monitor_provider));
-        let result = agent.process("test-conv", "hi", None).await.unwrap();
+        let result = agent.process_text("test-conv", "hi", None).await.unwrap();
         // After monitor feedback, agent refines — max_reviews=1 so second response goes through
         assert_eq!(result, "Refined response");
     }
@@ -1188,7 +1218,7 @@ mod tests {
         ]));
 
         let agent = make_agent(agent_provider, Some(monitor_provider));
-        let result = agent.process("test-conv", "hi", None).await.unwrap();
+        let result = agent.process_text("test-conv", "hi", None).await.unwrap();
         assert_eq!(result, "My response");
     }
 
@@ -1199,7 +1229,7 @@ mod tests {
         ]));
 
         let agent = make_agent(agent_provider, None);
-        let result = agent.process("test-conv", "hi", None).await.unwrap();
+        let result = agent.process_text("test-conv", "hi", None).await.unwrap();
         assert_eq!(result, "Direct response");
     }
 

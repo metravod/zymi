@@ -4,42 +4,83 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AddModelStep, App, ChatEntry, PROVIDER_OPTIONS};
+use super::app::{AddModelStep, App, ChatEntry, LeftPanelSection, PROVIDER_OPTIONS};
 use super::markdown::render_markdown;
 use super::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // Dynamic input height: grows with content, capped at 1/3 of screen
-    let input_lines = app.input.lines().len().max(1) as u16;
-    let max_input_height = (f.area().height / 3).max(3);
-    let input_height = (input_lines + 2).clamp(3, max_input_height);
+    let full_area = f.area();
+    let terminal_width = full_area.width;
 
-    let constraints = vec![
-        Constraint::Length(6), // header
-        Constraint::Min(5),   // chat area
-        Constraint::Length(1), // status line
-        Constraint::Length(input_height), // input
-    ];
+    // Outer frame wrapping everything
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Span::styled(
+            " zymi ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-    let chunks = Layout::default()
+    let inner_area = outer_block.inner(full_area);
+    f.render_widget(outer_block, full_area);
+
+    // Split: main content area + hint bar at bottom
+    let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(f.area());
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(inner_area);
 
-    // Header
-    draw_header(f, chunks[0], &app.current_model_id, app.copy_mode);
+    let content_area = outer_chunks[0];
+    let hint_area = outer_chunks[1];
 
-    // Chat area
-    draw_chat(f, app, chunks[1]);
+    // Auto-collapse panels on narrow terminals
+    let show_left = app.left_panel_visible && terminal_width >= 100;
+    let show_right = app.right_panel_visible && terminal_width >= 100;
 
-    // Status line
-    draw_status_line(f, app, chunks[2]);
+    let left_width: u16 = if show_left { 28 } else { 0 };
+    let right_width: u16 = if show_right { 52 } else { 0 };
 
-    // Input
-    draw_input(f, app, chunks[3]);
+    // Build horizontal constraints
+    let mut h_constraints = Vec::new();
+    if show_left {
+        h_constraints.push(Constraint::Length(left_width));
+    }
+    h_constraints.push(Constraint::Min(40)); // center
+    if show_right {
+        h_constraints.push(Constraint::Length(right_width));
+    }
 
-    // Overlays (rendered on top)
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(h_constraints)
+        .split(content_area);
 
+    let center_idx = if show_left { 1 } else { 0 };
+
+    // Left panel
+    if show_left {
+        draw_left_panel(f, app, h_chunks[0]);
+    }
+
+    // Center column
+    draw_center_column(f, app, h_chunks[center_idx]);
+
+    // Right panel
+    if show_right {
+        let right_idx = h_chunks.len() - 1;
+        let right_area = h_chunks[right_idx];
+        app.right_panel_x_range = (right_area.x, right_area.x + right_area.width);
+        draw_right_panel(f, app, right_area);
+    } else {
+        app.right_panel_x_range = (0, 0);
+    }
+
+    // Hint bar at the very bottom, inside the outer frame
+    draw_hint_bar(f, app, hint_area);
+
+    // Overlays (rendered on top of everything)
     if app.model_selector_open {
         draw_model_selector(f, app);
     }
@@ -49,10 +90,36 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_center_column(f: &mut Frame, app: &mut App, area: Rect) {
+    let input_lines = app.input.lines().len().max(1) as u16;
+    let max_input_height = (area.height / 3).max(3);
+    let input_height = (input_lines + 2).clamp(3, max_input_height);
+
+    let constraints = vec![
+        Constraint::Length(7),  // header
+        Constraint::Min(5),    // chat area
+        Constraint::Length(1), // status line
+        Constraint::Length(input_height), // input
+    ];
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    draw_header(f, chunks[0], &app.current_model_id, app.copy_mode);
+    draw_chat(f, app, chunks[1]);
+    draw_status_line(f, app, chunks[2]);
+    draw_input(f, app, chunks[3]);
+}
+
 fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
-    let art = Style::default()
-        .fg(theme::ACCENT)
-        .add_modifier(Modifier::BOLD);
+    // Per-letter gradient styles (pink → purple → blue → teal)
+    let sz = Style::default().fg(theme::LOGO_Z).add_modifier(Modifier::BOLD);
+    let sy = Style::default().fg(theme::LOGO_Y).add_modifier(Modifier::BOLD);
+    let sm = Style::default().fg(theme::LOGO_M).add_modifier(Modifier::BOLD);
+    let si = Style::default().fg(theme::LOGO_I).add_modifier(Modifier::BOLD);
+
     let dim = Style::default().fg(theme::SUBTEXT);
     let bold = Style::default()
         .fg(theme::TEXT)
@@ -60,21 +127,28 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let pad = "  ";
 
-    // Line 1: top of slant art
+    //          Z              Y              M              I
     let line1 = Line::from(vec![
-        Span::styled("     ____  __  __  ____ ___   __", art),
+        Span::styled(" ███████╗", sz),
+        Span::styled("██╗   ██╗", sy),
+        Span::styled("███╗   ███╗", sm),
+        Span::styled("██╗", si),
     ]);
 
-    // Line 2: middle + version
     let line2 = Line::from(vec![
-        Span::styled("    /_  / / / / / / __ `__ \\ / /", art),
+        Span::styled(" ╚══███╔╝", sz),
+        Span::styled("╚██╗ ██╔╝", sy),
+        Span::styled("████╗ ████║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim),
     ]);
 
-    // Line 3: middle + model + copy mode
     let mut line3_spans = vec![
-        Span::styled("     / /_/ /_/ / / / / / / // /", art),
+        Span::styled("   ███╔╝ ", sz),
+        Span::styled(" ╚████╔╝ ", sy),
+        Span::styled("██╔████╔██║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled("model: ", dim),
         Span::styled(model.to_string(), bold),
@@ -98,26 +172,38 @@ fn draw_header(f: &mut Frame, area: Rect, model: &str, copy_mode: bool) {
 
     let line3 = Line::from(line3_spans);
 
-    // Line 4: bottom + cwd
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let line4 = Line::from(vec![
-        Span::styled("    /___/\\__,_/ /_/ /_/ /_//_/", art),
+        Span::styled("  ███╔╝  ", sz),
+        Span::styled("  ╚██╔╝  ", sy),
+        Span::styled("██║╚██╔╝██║", sm),
+        Span::styled("██║", si),
         Span::raw(pad),
         Span::styled(cwd, dim),
     ]);
 
-    // Line 5: empty spacer
-    let line5 = Line::default();
+    let line5 = Line::from(vec![
+        Span::styled(" ███████╗", sz),
+        Span::styled("   ██║   ", sy),
+        Span::styled("██║ ╚═╝ ██║", sm),
+        Span::styled("██║", si),
+    ]);
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(theme::BORDER));
 
-    let header_widget = Paragraph::new(vec![line1, line2, line3, line4, line5])
-        .block(block)
-        .style(Style::default().bg(theme::SURFACE));
+    let line6 = Line::from(vec![
+        Span::styled(" ╚══════╝", sz),
+        Span::styled("   ╚═╝   ", sy),
+        Span::styled("╚═╝     ╚═╝", sm),
+        Span::styled("╚═╝", si),
+    ]);
+
+    let header_widget = Paragraph::new(vec![line1, line2, line3, line4, line5, line6])
+        .block(block);
 
     f.render_widget(header_widget, area);
 }
@@ -368,7 +454,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let (title, border_color, placeholder) = if app.pending_question.is_some() {
         (" reply > ", theme::WARNING, "Type your response... (Enter to send)")
     } else {
-        (" > ", theme::ACCENT, "Type your message... (Enter to send, Esc to quit)")
+        (" > ", theme::ACCENT, "Type your message... (Enter to send, Q to quit)")
     };
 
     let input_block = Block::default()
@@ -715,6 +801,279 @@ fn draw_add_model_form(f: &mut Frame, app: &App) {
     f.render_widget(popup, popup_area);
 }
 
+fn draw_left_panel(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.left_panel_focused;
+    let dim = Style::default().fg(theme::SUBTEXT);
+
+    // Split into 3 vertical blocks for Models, Files, SubAgents
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40), // Models
+            Constraint::Percentage(25), // System Files
+            Constraint::Percentage(35), // SubAgents
+        ])
+        .split(area);
+
+    // -- Models block --
+    let models_focused = focused && app.left_panel_section == LeftPanelSection::Models;
+    let models_border = if models_focused { theme::ACCENT } else { theme::BORDER };
+    let models_block = Block::default()
+        .title(Span::styled(
+            " Models ",
+            Style::default().fg(models_border).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(models_border));
+
+    let models_inner = models_block.inner(chunks[0]);
+    f.render_widget(models_block, chunks[0]);
+
+    let mut model_lines: Vec<Line<'static>> = Vec::new();
+    for (i, model) in app.available_models.iter().enumerate() {
+        let is_current = model.id == app.current_model_id;
+        let is_selected = models_focused && i == app.left_panel_index;
+        let marker = if is_current { "* " } else { "  " };
+
+        let style = if is_selected {
+            Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(theme::ACCENT)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        let name = truncate_str(&format!("{}{}", marker, model.name), models_inner.width as usize);
+        model_lines.push(Line::from(Span::styled(name, style)));
+    }
+    // "+ Add model" entry
+    let add_idx = app.available_models.len();
+    let is_add_selected = models_focused && app.left_panel_index == add_idx;
+    let add_style = if is_add_selected {
+        Style::default().fg(theme::SURFACE).bg(theme::SUCCESS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::SUCCESS)
+    };
+    model_lines.push(Line::from(Span::styled("  + Add model", add_style)));
+    f.render_widget(Paragraph::new(model_lines), models_inner);
+
+    // -- System Files block --
+    let sysfiles_focused = focused && app.left_panel_section == LeftPanelSection::SystemFiles;
+    let sysfiles_border = if sysfiles_focused { theme::ACCENT } else { theme::BORDER };
+    let sysfiles_block = Block::default()
+        .title(Span::styled(
+            " Files ",
+            Style::default().fg(sysfiles_border).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(sysfiles_border));
+
+    let sysfiles_inner = sysfiles_block.inner(chunks[1]);
+    f.render_widget(sysfiles_block, chunks[1]);
+
+    let mut file_lines: Vec<Line<'static>> = Vec::new();
+    for (i, file) in app.system_files.iter().enumerate() {
+        let is_selected = sysfiles_focused && i == app.left_panel_index;
+        let style = if is_selected {
+            Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            dim
+        };
+        file_lines.push(Line::from(Span::styled(format!(" {file}"), style)));
+    }
+    f.render_widget(Paragraph::new(file_lines), sysfiles_inner);
+
+    // -- SubAgents block --
+    let subagents_focused = focused && app.left_panel_section == LeftPanelSection::SubAgents;
+    let subagents_border = if subagents_focused { theme::ACCENT } else { theme::BORDER };
+    let subagents_block = Block::default()
+        .title(Span::styled(
+            " SubAgents ",
+            Style::default().fg(subagents_border).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(subagents_border));
+
+    let subagents_inner = subagents_block.inner(chunks[2]);
+    f.render_widget(subagents_block, chunks[2]);
+
+    let mut agent_lines: Vec<Line<'static>> = Vec::new();
+    if app.subagent_files.is_empty() {
+        agent_lines.push(Line::from(Span::styled(" (none)", dim)));
+    } else {
+        for (i, file) in app.subagent_files.iter().enumerate() {
+            let is_selected = subagents_focused && i == app.left_panel_index;
+            let name = file.trim_end_matches(".md");
+            let style = if is_selected {
+                Style::default().fg(theme::SURFACE).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            };
+            agent_lines.push(Line::from(Span::styled(format!(" {name}"), style)));
+        }
+    }
+    f.render_widget(Paragraph::new(agent_lines), subagents_inner);
+}
+
+fn draw_right_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.right_panel_focused;
+    let border_color = if focused { theme::ACCENT } else { theme::BORDER };
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Events ",
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.right_panel_events.is_empty() {
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "No events yet",
+            Style::default().fg(theme::SUBTEXT),
+        )));
+        f.render_widget(placeholder, inner);
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(theme::SUBTEXT);
+    let expanded_style = Style::default().fg(theme::TEXT);
+    let line_width = inner.width.saturating_sub(3) as usize;
+
+    for (i, entry) in app.right_panel_events.iter().enumerate() {
+        let is_selected = focused && i == app.right_panel_selected;
+        let is_expanded = app.right_panel_expanded.contains(&i);
+
+        // Timestamp + icon + kind
+        let kind_style = if entry.kind.starts_with("Tool") || entry.kind.starts_with("WF:") {
+            Style::default().fg(theme::TOOL)
+        } else if entry.kind.contains("LLM") {
+            Style::default().fg(theme::ACCENT)
+        } else if entry.kind == "Intention" || entry.kind == "Contract" {
+            Style::default().fg(theme::WARNING)
+        } else if entry.kind == "Response" || entry.kind == "Completed" {
+            Style::default().fg(theme::SUCCESS)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        // Selected row gets highlighted background
+        let row_style = if is_selected {
+            kind_style.bg(theme::SURFACE)
+        } else {
+            kind_style
+        };
+        let ts_style = if is_selected { dim.bg(theme::SURFACE) } else { dim };
+
+        let expand_marker = if is_expanded { "▾" } else if !entry.full_detail.is_empty() && focused { "▸" } else { " " };
+
+        lines.push(Line::from(vec![
+            Span::styled(expand_marker.to_string(), ts_style),
+            Span::styled(format!("{} ", entry.timestamp), ts_style),
+            Span::styled(format!("{} ", entry.icon), row_style),
+            Span::styled(entry.kind.clone(), row_style),
+        ]));
+
+        if is_expanded && !entry.full_detail.is_empty() {
+            // Show full detail, wrapped
+            for full_line in entry.full_detail.lines() {
+                for wrapped in wrap_text(full_line, line_width) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wrapped, expanded_style),
+                    ]));
+                }
+            }
+            lines.push(Line::default());
+        } else if !entry.detail.is_empty() {
+            // Collapsed: show short detail
+            let detail = truncate_str(&entry.detail, line_width);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(detail, dim),
+            ]));
+        }
+    }
+
+    let total_height = lines.len() as u16;
+    let visible = inner.height;
+    app.right_panel_total_lines = total_height;
+    app.right_panel_visible_height = visible;
+
+    // Scroll: auto_scroll means pinned to bottom, otherwise use offset
+    let max_scroll = total_height.saturating_sub(visible);
+    let scroll = if app.right_panel_auto_scroll {
+        app.right_panel_scroll = 0;
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.right_panel_scroll)
+    };
+
+    let panel = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(panel, inner);
+}
+
+fn draw_hint_bar(f: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().fg(theme::SUBTEXT);
+    let key_style = Style::default().fg(theme::ACCENT);
+
+    let hints = if app.right_panel_focused {
+        vec![
+            Span::styled(" \u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
+            Span::styled("Enter", key_style), Span::styled(":Expand ", dim),
+            Span::styled("\u{2190}", key_style), Span::styled(":Chat ", dim),
+            Span::styled("F2", key_style), Span::styled(":Hide ", dim),
+        ]
+    } else if app.left_panel_focused {
+        vec![
+            Span::styled(" Tab", key_style), Span::styled(":Section ", dim),
+            Span::styled("\u{2191}\u{2193}", key_style), Span::styled(":Nav ", dim),
+            Span::styled("Enter", key_style), Span::styled(":Select ", dim),
+            Span::styled("\u{2192}", key_style), Span::styled(":Chat ", dim),
+            Span::styled("Q", key_style), Span::styled(":Quit ", dim),
+            Span::styled("F1", key_style), Span::styled(":Hide ", dim),
+        ]
+    } else {
+        let mut h = vec![
+            Span::styled(" F1", key_style), Span::styled(":Sidebar", dim),
+        ];
+        if app.left_panel_visible {
+            h.push(Span::styled("*", Style::default().fg(theme::SUCCESS)));
+        }
+        h.extend([
+            Span::styled(" F2", key_style), Span::styled(":Events", dim),
+        ]);
+        if app.right_panel_visible {
+            h.push(Span::styled("*", Style::default().fg(theme::SUCCESS)));
+        }
+        if app.left_panel_visible {
+            h.extend([
+                Span::styled(" \u{2190}", key_style), Span::styled(":Sidebar ", dim),
+            ]);
+        }
+        if app.right_panel_visible {
+            h.extend([
+                Span::styled(" \u{2192}", key_style), Span::styled(":Events ", dim),
+            ]);
+        }
+        h.extend([
+            Span::styled(" ^M", key_style), Span::styled(":Model ", dim),
+            Span::styled("^Y", key_style), Span::styled(":Copy ", dim),
+            Span::styled("Esc", key_style), Span::styled(":Stop ", dim),
+            Span::styled("/quit", key_style), Span::styled(":Quit", dim),
+        ]);
+        h
+    };
+
+    let line = Line::from(hints);
+    let bar = Paragraph::new(line).style(Style::default().bg(theme::SURFACE));
+    f.render_widget(bar, area);
+}
+
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -722,4 +1081,26 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let end = s.floor_char_boundary(max_len);
         format!("{}...", &s[..end])
     }
+}
+
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 || s.is_empty() {
+        return vec![s.to_string()];
+    }
+    let mut result = Vec::new();
+    let mut remaining = s;
+    while remaining.len() > width {
+        let boundary = remaining.floor_char_boundary(width);
+        // Try to break at a space
+        let break_at = remaining[..boundary]
+            .rfind(' ')
+            .map(|i| i + 1)
+            .unwrap_or(boundary);
+        result.push(remaining[..break_at].to_string());
+        remaining = &remaining[break_at..];
+    }
+    if !remaining.is_empty() {
+        result.push(remaining.to_string());
+    }
+    result
 }

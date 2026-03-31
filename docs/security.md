@@ -33,6 +33,25 @@ Docker group membership is required for container management. Privilege escalati
 
 **Limitation:** the policy engine operates on the raw command string before `sh -c` interprets it. Shell variable expansion and subshells can theoretically bypass string checks. Defense-in-depth: the default policy is `require_approval`, so a human sees the command before execution.
 
+## ESAA Contracts
+
+Tools that modify state declare their side-effects as intentions. The ESAA orchestrator evaluates them against boundary contracts before execution. See [EDA & ESAA](eda-esaa.md).
+
+**Shell Policy Contract** — evaluates `ExecuteShellCommand` intentions against `policy.json` rules.
+
+**File Write Contract** — evaluates `WriteFile` intentions:
+- `allowed_dirs`: `["./memory/", "/tmp/"]`
+- `deny_patterns`: `["*.env", "*.key", "*.pem"]`
+
+## Sandbox
+
+Shell commands and code execution can be sandboxed for isolation. Configured via `memory/sandbox.json`:
+
+- **bubblewrap** (Linux) — uses `bwrap` for filesystem and network isolation
+- **native** (fallback) — runs directly, no isolation
+
+Per-context profiles control network access and writable paths. See [Configuration](configuration.md).
+
 ## Audit log
 
 Every tool call is logged to `memory/audit.jsonl` (append-only JSONL):
@@ -40,3 +59,5 @@ Every tool call is logged to `memory/audit.jsonl` (append-only JSONL):
 - Event types: `ToolCall`, `ShellCommand`, `ApprovalRequest`, `AgentStart`, `AgentStop`
 - Each entry includes arguments preview, result preview, and timestamp
 - Non-blocking async writer via mpsc channel
+
+Additionally, all domain events are persisted in the SQLite event store (append-only) for replay and debugging. ESAA intentions are hash-chained for tamper-evident auditability.

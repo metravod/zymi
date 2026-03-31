@@ -58,6 +58,12 @@ impl Tool for WebScrapeTool {
         true
     }
 
+    fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
+        let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let url = args["url"].as_str()?.to_string();
+        Some(crate::esaa::Intention::WebScrape { url })
+    }
+
     fn format_approval_request(&self, arguments: &str) -> String {
         let url = serde_json::from_str::<serde_json::Value>(arguments)
             .ok()

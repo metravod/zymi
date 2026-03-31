@@ -22,12 +22,36 @@ cargo test
 - Prefer `Result` over `unwrap()`/`expect()` in library code (fine in tests)
 - Keep functions focused — if it's doing too much, split it
 
+## Module structure
+
+```
+src/
+├── core/           # Agent loop, LLM providers, config
+├── connectors/     # CLI TUI, Telegram bot
+├── events/         # Event bus, store, agent worker, connector
+├── esaa/           # Intention orchestrator, contracts, projections
+├── skills/         # Skill loader, matcher, manager
+├── tools/          # All tool implementations
+├── workflow/       # DAG planner and executor
+├── sandbox/        # Bubblewrap + native sandbox
+├── storage/        # SQLite + in-memory storage
+├── policy.rs       # Shell command policy engine
+├── audit.rs        # Audit logging
+├── mcp.rs          # MCP server manager
+├── scheduler.rs    # Cron scheduler
+└── main.rs         # CLI commands and app wiring
+```
+
+## Architecture Decision Records
+
+Significant decisions are documented in `adr/`. See [CLAUDE.md](CLAUDE.md) for the ADR workflow.
+
 ## Pull requests
 
 - One feature or fix per PR
 - Write a clear description of what changed and why
 - Add tests for new functionality
-- Update README.md if you add user-facing features
+- Update docs if you add user-facing features
 
 ## Reporting issues
 

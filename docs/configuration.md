@@ -72,22 +72,44 @@ System prompt for the main agent. Plain markdown. If missing, a generic default 
 
 System prompts for sub-agents. Created and managed by the bot via the `create_sub_agent` tool.
 
+## `sandbox.json`
+
+Code execution sandbox configuration. See [Security](security.md#sandbox).
+
+```json
+{
+  "backend": "bubblewrap",
+  "profiles": {
+    "interactive": { "network": true, "writable_paths": ["/tmp"] },
+    "eval": { "network": false, "writable_paths": [] }
+  }
+}
+```
+
+Backends: `"bubblewrap"` (Linux, requires `bwrap`), `"native"` (fallback, no isolation).
+
+## `skills/registry.json`
+
+Installed skills index. Managed by `manage_skills` tool. See [Skills](skills.md).
+
 ## Directory structure
 
 ```
 memory/
 ├── AGENT.md               # Main agent system prompt
-├── models.json            # LLM provider configuration (see models.json.example)
-├── models.json.example    # Example model config (committed)
-├── mcp.json               # MCP server configuration (see mcp.json.example)
-├── mcp.json.example       # Example MCP config (committed)
+├── models.json            # LLM provider configuration
+├── mcp.json               # MCP server configuration
 ├── policy.json            # Shell command policy rules
+├── sandbox.json           # Sandbox configuration
 ├── schedule.json          # Scheduled tasks (auto-managed)
 ├── auth.json              # OAuth tokens (ChatGPT)
 ├── audit.jsonl            # Append-only audit log
-├── conversations.db       # Conversation history (SQLite)
+├── conversations.db       # SQLite: conversations + event store
 ├── subagents/
 │   └── {name}.md          # Sub-agent prompts
+├── skills/
+│   ├── registry.json      # Installed skills index
+│   └── {repo-name}/       # Git clones of skill repos
 ├── evals/
 │   └── {name}.json        # Eval test suites
 ├── eval_results/

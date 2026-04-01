@@ -75,6 +75,10 @@ impl Tool for RunCodeTool {
         )
     }
 
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }

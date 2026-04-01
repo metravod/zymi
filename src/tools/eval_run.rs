@@ -23,6 +23,10 @@ impl RunEvalsTool {
 
 #[async_trait]
 impl Tool for RunEvalsTool {
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         let available = eval::list_eval_files(&self.memory_dir);
         let evals_list = if available.is_empty() {

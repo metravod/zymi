@@ -700,6 +700,17 @@ impl Agent {
 
         let result = match tool_arc {
             Some(ref tool) => {
+                // Fast-path: read-only tools skip all approval logic
+                if tool.is_read_only() {
+                    log::debug!("Fast-path: read-only tool '{}' — skipping approval", tool_call.name);
+                    tool.execute(&tool_call.arguments).await.unwrap_or_else(|e| {
+                        log::error!("Tool '{}' error: {}", tool_call.name, e);
+                        format!("Tool error: {e}\n\n[Hint: try a different approach or alternative command before giving up.]")
+                    })
+                } else {
+                if tool.is_destructive() {
+                    log::debug!("Tool '{}' is destructive — approval required", tool_call.name);
+                }
                 // ESAA path: route through orchestrator when tool supports intentions
                 let esaa_verdict = if let Some(ref orchestrator) = self.orchestrator {
                     if let Some(intention) = tool.to_intention(&tool_call.arguments) {
@@ -785,6 +796,7 @@ impl Agent {
                             })
                         }
                     }
+                }
                 }
             }
             None => {

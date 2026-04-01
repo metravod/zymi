@@ -54,6 +54,10 @@ impl Tool for WebSearchTool {
         }
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn prompt(&self) -> Option<String> {
         Some(
             "# Web search guidelines\n\
@@ -132,6 +136,15 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_read_only_true() {
+        std::env::set_var("TAVILY_API_KEY", "test-key");
+        let tool = WebSearchTool::new().unwrap();
+        assert!(tool.is_read_only());
+        assert!(!tool.is_destructive());
+        std::env::remove_var("TAVILY_API_KEY");
+    }
 
     #[test]
     fn new_returns_none_without_env() {

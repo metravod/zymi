@@ -20,6 +20,10 @@ impl ReadMemoryTool {
 
 #[async_trait]
 impl Tool for ReadMemoryTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_memory".to_string(),

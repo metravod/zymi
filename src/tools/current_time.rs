@@ -20,6 +20,10 @@ impl Tool for CurrentTimeTool {
         }
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, _arguments: &str) -> Result<String, String> {
         Ok(Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string())
     }

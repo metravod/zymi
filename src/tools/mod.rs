@@ -35,6 +35,18 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this tool only reads data and has no side effects.
+    /// Read-only tools skip approval in both ESAA and legacy paths.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool performs destructive or hard-to-reverse operations.
+    /// Destructive tools always require approval, even if auto-approve is enabled.
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
     fn requires_approval(&self) -> bool {
         false
     }
@@ -53,5 +65,50 @@ pub trait Tool: Send + Sync {
     /// Returns None for tools that haven't been migrated to the intention model yet.
     fn to_intention(&self, _arguments: &str) -> Option<Intention> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use current_time::CurrentTimeTool;
+
+    // -- trait default tests --
+
+    struct DummyTool;
+    #[async_trait]
+    impl Tool for DummyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "dummy".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        async fn execute(&self, _args: &str) -> Result<String, String> {
+            Ok("ok".into())
+        }
+    }
+
+    #[test]
+    fn defaults_are_conservative() {
+        let t = DummyTool;
+        assert!(!t.is_read_only(), "default is_read_only should be false");
+        assert!(!t.is_destructive(), "default is_destructive should be false");
+        assert!(!t.requires_approval(), "default requires_approval should be false");
+    }
+
+    #[test]
+    fn read_only_and_destructive_are_mutually_exclusive_on_real_tools() {
+        // CurrentTimeTool is read-only
+        let t = CurrentTimeTool;
+        assert!(t.is_read_only());
+        assert!(!t.is_destructive());
+    }
+
+    #[test]
+    fn current_time_is_read_only() {
+        assert!(CurrentTimeTool.is_read_only());
+        assert!(!CurrentTimeTool.requires_approval());
     }
 }

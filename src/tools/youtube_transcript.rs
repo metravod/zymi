@@ -64,6 +64,10 @@ impl Tool for YouTubeTranscriptTool {
         }
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }

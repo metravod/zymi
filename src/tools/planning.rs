@@ -149,6 +149,10 @@ impl Tool for PlanningTool {
         }
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn prompt(&self) -> Option<String> {
         Some(
             "# Planning guidelines\n\

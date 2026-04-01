@@ -253,6 +253,10 @@ impl CheckTaskTool {
 
 #[async_trait]
 impl Tool for CheckTaskTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "check_task".to_string(),
@@ -331,6 +335,10 @@ impl ListTasksTool {
 
 #[async_trait]
 impl Tool for ListTasksTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_tasks".to_string(),

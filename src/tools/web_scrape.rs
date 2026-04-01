@@ -54,6 +54,10 @@ impl Tool for WebScrapeTool {
         }
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn prompt(&self) -> Option<String> {
         Some(
             "# Web scraping guidelines\n\
@@ -145,6 +149,15 @@ mod tests {
 
     fn args(url: &str) -> String {
         serde_json::json!({ "url": url }).to_string()
+    }
+
+    #[test]
+    fn is_read_only_true() {
+        std::env::set_var("FIRECRAWL_API_KEY", "test-key");
+        let tool = WebScrapeTool::new().unwrap();
+        assert!(tool.is_read_only());
+        assert!(!tool.is_destructive());
+        std::env::remove_var("FIRECRAWL_API_KEY");
     }
 
     #[test]

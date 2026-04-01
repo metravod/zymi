@@ -231,6 +231,10 @@ impl Tool for ShellTool {
         )
     }
 
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }
@@ -371,6 +375,14 @@ mod tests {
 
     fn args(command: &str) -> String {
         serde_json::json!({ "command": command }).to_string()
+    }
+
+    #[test]
+    fn is_destructive_true() {
+        let tool = ShellTool::new();
+        assert!(tool.is_destructive());
+        assert!(!tool.is_read_only());
+        assert!(tool.requires_approval());
     }
 
     #[tokio::test]

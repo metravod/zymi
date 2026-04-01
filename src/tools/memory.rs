@@ -167,6 +167,19 @@ impl Tool for WriteMemoryTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Memory writing guidelines\n\
+            - Use memory to persist facts, decisions, and context that will be useful across sessions.\n\
+            - Keep entries concise and structured — use markdown headings and bullet points.\n\
+            - Read existing memory files before writing to avoid duplicates.\n\
+            - Use descriptive filenames: 'project_architecture.md', not 'notes.md'.\n\
+            - Do NOT store secrets, credentials, or temporary data in memory.\n\
+            - For sub-agent prompts, use create_sub_agent (overwrites) instead of write_memory (appends)."
+                .to_string(),
+        )
+    }
+
     fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
         let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
         let key = args.get("filename")?.as_str()?.to_string();

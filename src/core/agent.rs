@@ -361,10 +361,20 @@ impl Agent {
     }
 
     /// Get tool definitions, optionally filtered by the tool selector.
+    /// If a tool provides a `prompt()`, it is appended to the description.
     async fn get_tool_definitions(&self, query: &str) -> Vec<ToolDefinition> {
         let all: Vec<ToolDefinition> = {
             let tools = self.tools.read().await;
-            tools.iter().map(|t| t.definition()).collect()
+            tools
+                .iter()
+                .map(|t| {
+                    let mut def = t.definition();
+                    if let Some(prompt) = t.prompt() {
+                        def.description = format!("{}\n\n{}", def.description, prompt);
+                    }
+                    def
+                })
+                .collect()
         };
         let selector = self.tool_selector.read().await;
         if let Some(ref sel) = *selector {

@@ -369,7 +369,16 @@ impl DagExecutor {
         );
 
         let tools = self.build_tools_for_node(node);
-        let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
+        let tool_defs: Vec<ToolDefinition> = tools
+            .iter()
+            .map(|t| {
+                let mut def = t.definition();
+                if let Some(prompt) = t.prompt() {
+                    def.description = format!("{}\n\n{}", def.description, prompt);
+                }
+                def
+            })
+            .collect();
 
         let mut messages = vec![
             Message::System(system_prompt),

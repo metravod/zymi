@@ -60,6 +60,21 @@ impl Tool for RunCodeTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Code execution guidelines\n\
+            - Use Python for data processing, calculations, API calls, and complex logic.\n\
+            - Use Bash for file manipulation, pipelines, and system tasks.\n\
+            - Use Node.js only when working with JS-specific libraries.\n\
+            - Always `import` / `require` needed modules at the top of the code.\n\
+            - Print results to stdout — the output is your return value.\n\
+            - Handle errors gracefully: catch exceptions and print useful diagnostics.\n\
+            - For large data, process in chunks rather than loading everything into memory.\n\
+            - Prefer run_code over execute_shell when the task requires logic, loops, or structured output."
+                .to_string(),
+        )
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }

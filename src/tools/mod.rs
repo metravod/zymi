@@ -28,6 +28,13 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, arguments: &str) -> Result<String, String>;
 
+    /// Return a rich, contextual prompt that guides the LLM on how to use this tool.
+    /// Merged into the tool description sent to the API. Use this for behavioral
+    /// guidelines, safety constraints, and when-to-use-vs-alternatives guidance.
+    fn prompt(&self) -> Option<String> {
+        None
+    }
+
     fn requires_approval(&self) -> bool {
         false
     }

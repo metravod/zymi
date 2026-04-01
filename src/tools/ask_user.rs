@@ -43,6 +43,18 @@ impl Tool for AskUserTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# User interaction guidelines\n\
+            - Only ask when you genuinely cannot proceed without user input.\n\
+            - Batch related questions into a single ask — don't ping the user repeatedly.\n\
+            - Provide context in your question: what you tried, what you need, and suggested options.\n\
+            - Never use ask_user for status updates — just proceed and report results.\n\
+            - If the user is unavailable (non-interactive mode), gracefully fall back to a reasonable default."
+                .to_string(),
+        )
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String, String> {
         let args: serde_json::Value =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;

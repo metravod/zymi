@@ -54,6 +54,18 @@ impl Tool for WebScrapeTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Web scraping guidelines\n\
+            - Use web_search first to find the right URL, then web_scrape to read it.\n\
+            - Only scrape pages you have a clear reason to read — avoid speculative scraping.\n\
+            - Content is returned as markdown, truncated at 15,000 chars. For long pages, \
+            focus on extracting the specific information you need.\n\
+            - Do not scrape pages that require authentication or contain private content."
+                .to_string(),
+        )
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }

@@ -216,6 +216,21 @@ impl Tool for ShellTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Shell execution guidelines\n\
+            - Always check command exit codes. If a command fails, read the error before retrying.\n\
+            - For multi-step operations, chain with `&&` so failures stop early.\n\
+            - Prefer specific, targeted commands over broad ones (e.g. `grep -r pattern dir/` over `find / ...`).\n\
+            - When installing packages, use the system's package manager (apt, brew, dnf) or language-specific (pip, npm, cargo).\n\
+            - For file downloads, verify checksums or use HTTPS.\n\
+            - Never store secrets, passwords, or API keys in shell commands — use environment variables.\n\
+            - Use `background=true` for commands expected to take over 30 seconds.\n\
+            - If you need to edit a file, prefer `sed` or `tee` over `echo >>` for reliability."
+                .to_string(),
+        )
+    }
+
     fn requires_approval(&self) -> bool {
         true
     }

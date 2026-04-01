@@ -149,6 +149,19 @@ impl Tool for PlanningTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Planning guidelines\n\
+            - ALWAYS use think before executing multi-step or ambiguous tasks.\n\
+            - Each approach should be genuinely different, not minor variations.\n\
+            - Use simulation_task to probe feasibility when uncertain — it's cheap.\n\
+            - After planning, commit to the selected approach. Don't re-plan unless you hit a blocker.\n\
+            - Include concrete execution_steps — vague plans lead to vague results.\n\
+            - Consider delegation: if a step is independent, spawn_task can run it in parallel."
+                .to_string(),
+        )
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String, String> {
         let args: PlanningArgs =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;

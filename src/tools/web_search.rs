@@ -54,6 +54,18 @@ impl Tool for WebSearchTool {
         }
     }
 
+    fn prompt(&self) -> Option<String> {
+        Some(
+            "# Web search guidelines\n\
+            - Formulate specific, targeted queries. Avoid overly broad or vague searches.\n\
+            - When searching for technical solutions, include the language/framework and error message.\n\
+            - If the first search doesn't yield results, reformulate with different keywords.\n\
+            - After searching, use web_scrape to read the most promising result in full.\n\
+            - Prefer web_search for discovery, web_scrape for reading specific pages."
+                .to_string(),
+        )
+    }
+
     fn to_intention(&self, arguments: &str) -> Option<crate::esaa::Intention> {
         let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
         let query = args["query"].as_str()?.to_string();

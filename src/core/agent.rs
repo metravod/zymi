@@ -481,10 +481,26 @@ impl Agent {
 
     /// Run the monitor to evaluate a proposed response.
     /// Returns `Some(feedback)` if revision is needed, `None` if approved or on error.
-    async fn run_monitor(&self, messages: &[Message], proposed: &str) -> Option<String> {
+    async fn run_monitor(
+        &self,
+        messages: &[Message],
+        proposed: &str,
+        tool_names: &[String],
+    ) -> Option<String> {
         let monitor = self.monitor.as_ref()?;
 
-        let mut monitor_messages = vec![Message::System(MONITOR_SYSTEM_PROMPT.to_string())];
+        let system_prompt = if tool_names.is_empty() {
+            MONITOR_SYSTEM_PROMPT.to_string()
+        } else {
+            format!(
+                "{}\n\nThe assistant has access to these tools: {}. \
+                Do NOT mark a response as incorrect for mentioning capabilities \
+                provided by these tools.",
+                MONITOR_SYSTEM_PROMPT,
+                tool_names.join(", ")
+            )
+        };
+        let mut monitor_messages = vec![Message::System(system_prompt)];
 
         // Include conversation context (skip system prompt — monitor has its own)
         for msg in messages {
@@ -944,6 +960,8 @@ impl Agent {
         let mut monitor_reviews: usize = 0;
         let mut tool_call_cache: HashMap<String, ()> = HashMap::new();
         let mut msg_count = history_len;
+        let mut consecutive_dup_iterations: usize = 0;
+        const MAX_CONSECUTIVE_DUP_ITERATIONS: usize = 2;
 
         for iteration in 0..self.max_iterations {
             log::info!("Stream iteration {}/{}", iteration + 1, self.max_iterations);
@@ -988,7 +1006,8 @@ impl Agent {
 
                 if pending_review {
                     log::info!("Monitor: draft response ({} chars):\n{content}", content.len());
-                    if let Some(feedback) = self.run_monitor(&messages, &content).await {
+                    let tool_names: Vec<String> = tool_definitions.iter().map(|t| t.name.clone()).collect();
+                    if let Some(feedback) = self.run_monitor(&messages, &content, &tool_names).await {
                         log::info!("Monitor: feedback:\n{feedback}");
                         messages.push(Message::User(format!(
                             "[INTERNAL — revision required]\n\
@@ -1027,6 +1046,7 @@ impl Agent {
             msg_count += 1;
 
             let mut abort_for_photo = false;
+            let mut all_dups_in_iteration = true;
 
             for tool_call in &response.tool_calls {
                 log::info!(
@@ -1060,6 +1080,10 @@ impl Agent {
                     .await?;
                 let tool_end = langfuse::timestamp();
                 let duration_ms = tool_start_time.elapsed().as_millis() as u64;
+
+                if !is_dup {
+                    all_dups_in_iteration = false;
+                }
 
                 let is_error = is_dup
                     || result.starts_with("Tool error:")
@@ -1102,6 +1126,20 @@ impl Agent {
             if abort_for_photo {
                 let _ = event_tx.send(StreamEvent::Done(String::new()));
                 return Ok(String::new());
+            }
+
+            // Break out of the loop if the model keeps making only duplicate calls
+            if all_dups_in_iteration {
+                consecutive_dup_iterations += 1;
+                if consecutive_dup_iterations >= MAX_CONSECUTIVE_DUP_ITERATIONS {
+                    log::warn!(
+                        "Stream: {} consecutive iterations with only duplicate tool calls, forcing conclusion",
+                        consecutive_dup_iterations
+                    );
+                    break;
+                }
+            } else {
+                consecutive_dup_iterations = 0;
             }
         }
 
